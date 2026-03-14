@@ -17,6 +17,12 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 from loguru import logger
+
+try:
+    import json5 as _json5  # lenient parser: handles trailing commas, unquoted keys
+    _HAS_JSON5 = True
+except ImportError:
+    _HAS_JSON5 = False
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -215,8 +221,16 @@ def _extract_json(text: str) -> Optional[Dict[str, Any]]:
         elif ch == "}":
             depth -= 1
             if depth == 0 and start is not None:
+                candidate = text[start : i + 1]
                 try:
-                    return json.loads(text[start : i + 1])
+                    return json.loads(candidate)
                 except json.JSONDecodeError:
+                    # Lenient fallback: json5 tolerates trailing commas, unquoted keys
+                    if _HAS_JSON5:
+                        try:
+                            return _json5.loads(candidate)
+                        except Exception:
+                            pass
+                    logger.debug(f"_extract_json: unparseable block at [{start}:{i+1}]: {candidate[:120]!r}")
                     start = None
     return None
