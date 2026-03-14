@@ -1,0 +1,38 @@
+# ── Core ──────────────────────────────────────────────────────────────────────
+ccxt>=4.3.0               # Exchange connectivity (crypto + stocks via CCXT Pro)
+pandas>=2.1.0
+numpy>=1.26.0
+ta>=0.11.0                # Technical analysis indicators
+pandas-ta>=0.3.14b        # Extended TA library
+
+# ── LLM / AI ──────────────────────────────────────────────────────────────────
+httpx>=0.27.0             # Async HTTP for Ollama API
+openai>=1.30.0            # OpenAI-compatible client (also works with Ollama)
+tiktoken>=0.7.0           # Token counting
+
+# ── Data & Schema ─────────────────────────────────────────────────────────────
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+PyYAML>=6.0.1
+python-dotenv>=1.0.0
+aiosqlite>=0.20.0         # Async SQLite for trade log / state persistence
+
+# ── Async & Concurrency ───────────────────────────────────────────────────────
+aiohttp>=3.9.0
+asyncio-throttle>=1.0.2
+
+# ── Monitoring & CLI ──────────────────────────────────────────────────────────
+rich>=13.7.0              # Terminal UI / dashboard
+loguru>=0.7.2             # Structured logging
+prometheus-client>=0.20.0 # Metrics endpoint
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+python-dateutil>=2.9.0
+pytz>=2024.1
+tenacity>=8.3.0           # Retry with exponential back-off
+schedule>=1.2.1           # Lightweight scheduler
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+pytest>=8.2.0
+pytest-asyncio>=0.23.0
+pytest-mock>=3.14.0
