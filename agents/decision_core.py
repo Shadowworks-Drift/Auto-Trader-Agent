@@ -41,6 +41,7 @@ class TradeProposal:
     reasoning: str = ""
     adversarial_summary: str = ""
     sizing_method: str = "kelly_lite"  # "rl_ppo" | "half_kelly" | "kelly_lite"
+    regime: str = "unknown"
     timestamp: datetime = field(default_factory=datetime.utcnow)
 
     @property
