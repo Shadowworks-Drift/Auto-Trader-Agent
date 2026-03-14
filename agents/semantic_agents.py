@@ -240,6 +240,7 @@ class SentimentAgent(_LLMAgent):
         headlines = snapshot.news_headlines_text()
         alt_data_text = snapshot.alt_data_text() if hasattr(snapshot, "alt_data_text") else "N/A"
         social_signals = str(snapshot.social_signals) if snapshot.social_signals else "N/A"
+        alt_data_text = snapshot.alt_data_text()
 
         # Inject FinBERT pre-score into context for Ollama
         if finbert_score:
