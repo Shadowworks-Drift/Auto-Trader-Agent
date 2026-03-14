@@ -1,0 +1,301 @@
+"""
+Decision Core — Adversarial Decision Framework.
+
+Fuses signals from Quant, Trend, Setup, Trigger, and Sentiment agents using
+configurable weights.  When adversarial mode is on, a Bear or Bull advocate
+LLM agent challenges the proposal before the final confidence score is computed.
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+from loguru import logger
+
+from config.settings import Settings
+from data.market_data import MarketSnapshot
+from llm.ollama_client import OllamaClient
+from llm.prompts import PromptLibrary
+from .base_agent import AgentResult
+
+
+@dataclass
+class TradeProposal:
+    symbol: str
+    direction: str           # "long" | "short" | "none"
+    confidence: float        # 0.0 – 1.0
+    entry_price: float
+    stop_loss: float
+    take_profit: float
+    position_size_pct: float
+    agent_scores: Dict[str, float] = field(default_factory=dict)
+    reasoning: str = ""
+    adversarial_summary: str = ""
+    timestamp: datetime = field(default_factory=datetime.utcnow)
+
+    @property
+    def risk_pct(self) -> float:
+        if self.entry_price <= 0:
+            return 0.0
+        return abs(self.entry_price - self.stop_loss) / self.entry_price
+
+    @property
+    def reward_pct(self) -> float:
+        if self.entry_price <= 0:
+            return 0.0
+        return abs(self.take_profit - self.entry_price) / self.entry_price
+
+    @property
+    def risk_reward(self) -> float:
+        return self.reward_pct / max(self.risk_pct, 1e-9)
+
+    def is_actionable(self, min_confidence: float) -> bool:
+        return self.direction != "none" and self.confidence >= min_confidence
+
+
+class DecisionCore:
+    """
+    Fuses all agent outputs into a single TradeProposal.
+
+    Weights (configurable in settings.decision):
+      quant   40%  |  trend  20%  |  setup  20%  |  trigger  10%  |  sentiment  10%
+    """
+
+    def __init__(self, settings: Settings, llm: OllamaClient) -> None:
+        self.settings = settings
+        self.cfg = settings.decision
+        self.risk_cfg = settings.risk
+        self.llm = llm
+
+    async def decide(
+        self,
+        snapshot: MarketSnapshot,
+        quant_result: AgentResult,
+        trend_result: AgentResult,
+        setup_result: AgentResult,
+        trigger_result: AgentResult,
+        sentiment_result: AgentResult,
+    ) -> TradeProposal:
+        t0 = time.perf_counter()
+
+        # ── Step 1: directional vote ───────────────────────────────────────
+        direction = self._majority_direction(
+            [quant_result, trend_result, setup_result, trigger_result, sentiment_result]
+        )
+
+        if direction == "none":
+            return TradeProposal(
+                symbol=snapshot.symbol,
+                direction="none",
+                confidence=0.0,
+                entry_price=snapshot.current_price,
+                stop_loss=0.0,
+                take_profit=0.0,
+                position_size_pct=0.0,
+                reasoning="No directional consensus across agents.",
+            )
+
+        # ── Step 2: fuse confidence scores ────────────────────────────────
+        score = self._fuse_scores(direction, quant_result, trend_result, setup_result, trigger_result, sentiment_result)
+
+        # ── Step 3: compute entry / SL / TP ───────────────────────────────
+        price = snapshot.current_price
+        entry, sl, tp = self._compute_levels(direction, price, trigger_result, setup_result)
+
+        # ── Step 4: adversarial debate ────────────────────────────────────
+        adversarial_summary = ""
+        if self.cfg.adversarial_veto and score >= self.cfg.min_confidence * 0.8:
+            adv_discount, adversarial_summary = await self._run_adversarial(
+                snapshot, direction, entry, sl, tp, quant_result, trend_result
+            )
+            score = max(0.0, score - adv_discount)
+
+        # ── Step 5: position sizing ────────────────────────────────────────
+        position_size_pct = self._size_position(score, entry, sl)
+
+        reasoning = self._build_reasoning(
+            direction, score, quant_result, trend_result, setup_result, trigger_result, sentiment_result
+        )
+
+        elapsed = (time.perf_counter() - t0) * 1000
+        logger.info(
+            f"DecisionCore [{snapshot.symbol}] → {direction.upper()} "
+            f"confidence={score:.2f} entry={entry:.4f} sl={sl:.4f} tp={tp:.4f} "
+            f"({elapsed:.0f}ms)"
+        )
+
+        return TradeProposal(
+            symbol=snapshot.symbol,
+            direction=direction,
+            confidence=round(score, 4),
+            entry_price=round(entry, 8),
+            stop_loss=round(sl, 8),
+            take_profit=round(tp, 8),
+            position_size_pct=round(position_size_pct, 4),
+            agent_scores={
+                "quant": _dir_score(direction, quant_result),
+                "trend": _dir_score(direction, trend_result),
+                "setup": _dir_score(direction, setup_result),
+                "trigger": _dir_score(direction, trigger_result),
+                "sentiment": _dir_score(direction, sentiment_result),
+            },
+            reasoning=reasoning,
+            adversarial_summary=adversarial_summary,
+        )
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _majority_direction(self, results: List[AgentResult]) -> str:
+        votes: Dict[str, float] = {"long": 0.0, "short": 0.0, "none": 0.0}
+        for r in results:
+            if r.success:
+                d = r.direction
+                key = d if d in votes else "none"
+                votes[key] += r.confidence
+        best = max(votes, key=lambda k: votes[k])
+        total_directional = votes["long"] + votes["short"]
+        if total_directional < 0.1:
+            return "none"
+        agreement = votes[best] / max(total_directional, 1e-9)
+        if agreement < self.cfg.consensus_threshold:
+            return "none"
+        return best
+
+    def _fuse_scores(
+        self,
+        direction: str,
+        quant: AgentResult,
+        trend: AgentResult,
+        setup: AgentResult,
+        trigger: AgentResult,
+        sentiment: AgentResult,
+    ) -> float:
+        w = self.cfg
+        weighted = (
+            _dir_score(direction, quant) * w.quant_weight
+            + _dir_score(direction, trend) * w.trend_weight
+            + _dir_score(direction, setup) * w.setup_weight
+            + _dir_score(direction, trigger) * w.trigger_weight
+            + _dir_score(direction, sentiment) * w.sentiment_weight
+        )
+        total_w = w.quant_weight + w.trend_weight + w.setup_weight + w.trigger_weight + w.sentiment_weight
+        return round(weighted / max(total_w, 1e-9), 4)
+
+    def _compute_levels(
+        self,
+        direction: str,
+        price: float,
+        trigger: AgentResult,
+        setup: AgentResult,
+    ) -> tuple:
+        # Prefer LLM-suggested levels when available and plausible
+        entry = float(trigger.data.get("entry_price") or price)
+        sl = float(trigger.data.get("stop_loss") or setup.data.get("invalidation_price") or 0)
+        tp = float(trigger.data.get("take_profit") or setup.data.get("target_price") or 0)
+
+        # Fallback to percentage-based levels
+        sl_pct = self.risk_cfg.stop_loss_pct
+        tp_pct = self.risk_cfg.take_profit_pct
+        if entry <= 0:
+            entry = price
+        if direction == "long":
+            if sl <= 0 or sl >= entry:
+                sl = entry * (1 - sl_pct)
+            if tp <= 0 or tp <= entry:
+                tp = entry * (1 + tp_pct)
+        else:
+            if sl <= 0 or sl <= entry:
+                sl = entry * (1 + sl_pct)
+            if tp <= 0 or tp >= entry:
+                tp = entry * (1 - tp_pct)
+
+        return entry, sl, tp
+
+    def _size_position(self, confidence: float, entry: float, sl: float) -> float:
+        """Kelly-lite fractional position sizing."""
+        base_size = self.settings.trading.position_size_pct
+        # Scale by confidence (cap at base_size)
+        return min(base_size * confidence, base_size)
+
+    async def _run_adversarial(
+        self,
+        snapshot: MarketSnapshot,
+        direction: str,
+        entry: float,
+        sl: float,
+        tp: float,
+        quant: AgentResult,
+        trend: AgentResult,
+    ) -> tuple:
+        """Run a bear or bull advocate and return (confidence_discount, summary)."""
+        market_data = (
+            quant.data.get("summary_text", "")
+            + "\n"
+            + trend.data.get("reasoning", "")
+        )
+        try:
+            if direction == "long":
+                bull_summary = trend.data.get("reasoning", "Bullish trend identified.")
+                user_msg = PromptLibrary.render(
+                    PromptLibrary.ADVERSARIAL_BEAR,
+                    symbol=snapshot.symbol,
+                    entry_price=str(entry),
+                    stop_loss=str(sl),
+                    take_profit=str(tp),
+                    bull_summary=bull_summary,
+                    market_data=market_data,
+                )
+                system = PromptLibrary.SYSTEM_BEAR_ADVOCATE
+            else:
+                bear_summary = trend.data.get("reasoning", "Bearish trend identified.")
+                user_msg = PromptLibrary.render(
+                    PromptLibrary.ADVERSARIAL_BULL,
+                    symbol=snapshot.symbol,
+                    entry_price=str(entry),
+                    stop_loss=str(sl),
+                    take_profit=str(tp),
+                    bear_summary=bear_summary,
+                    market_data=market_data,
+                )
+                system = PromptLibrary.SYSTEM_BULL_ADVOCATE
+
+            resp = await self.llm.chat(
+                messages=[{"role": "user", "content": user_msg}],
+                system=system,
+                expect_json=True,
+            )
+            parsed = resp.parsed or {}
+            conviction_key = "overall_bearish_conviction" if direction == "long" else "overall_bullish_conviction"
+            adv_conviction = float(parsed.get(conviction_key, 0.3))
+            # Discount confidence proportional to adversarial conviction
+            discount = adv_conviction * 0.25
+            args = parsed.get("bear_arguments" if direction == "long" else "bull_arguments", [])
+            summary = f"Adversarial ({direction} challenged):\n" + "\n".join(f"  - {a}" for a in args[:5])
+            return discount, summary
+        except Exception as exc:
+            logger.warning(f"Adversarial debate failed: {exc}")
+            return 0.0, ""
+
+    def _build_reasoning(self, direction: str, score: float, *results: AgentResult) -> str:
+        lines = [f"Decision: {direction.upper()} | Confidence: {score:.2f}"]
+        for r in results:
+            if r.success:
+                reasoning = r.data.get("reasoning", "")[:150]
+                lines.append(f"  [{r.agent_name}] {reasoning}")
+        return "\n".join(lines)
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _dir_score(direction: str, result: AgentResult) -> float:
+    """Score [0,1] representing how much this agent supports the chosen direction."""
+    if not result.success:
+        return 0.0
+    if result.direction == direction:
+        return result.confidence
+    if result.direction == "none":
+        return result.confidence * 0.5
+    return 0.0  # opposing direction = 0

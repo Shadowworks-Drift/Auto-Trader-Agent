@@ -1,0 +1,114 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# Auto-Trader-Agent  ·  Default Configuration
+# ══════════════════════════════════════════════════════════════════════════════
+# Copy this file to config/config.yaml and customise.
+# Environment variables (AUTO_TRADER_*) override every value here.
+
+# ── Trading Mode ──────────────────────────────────────────────────────────────
+trading:
+  mode: paper                 # paper | live
+  markets: crypto             # crypto | stocks | both
+  symbols:
+    - BTC/USDT
+    - ETH/USDT
+    - SOL/USDT
+    - BNB/USDT
+    - AVAX/USDT
+  timeframes:
+    primary: 4h               # main decision timeframe
+    context: 1d               # higher-level trend context
+    entry: 1h                 # entry-trigger refinement
+  loop_interval_seconds: 300  # how often the main loop runs (5 min)
+  max_open_positions: 3
+  position_size_pct: 0.05     # fraction of portfolio per trade
+
+# ── Risk Management ───────────────────────────────────────────────────────────
+risk:
+  max_portfolio_drawdown_pct: 0.15  # halt trading if portfolio drops >15%
+  max_daily_loss_pct: 0.05          # daily loss circuit-breaker
+  stop_loss_pct: 0.03               # per-trade stop loss (3%)
+  take_profit_pct: 0.06             # per-trade take profit (6%)
+  trailing_stop: false              # enable trailing stop
+  trailing_stop_pct: 0.02
+  min_risk_reward_ratio: 1.5        # skip trades below this R:R
+  max_correlated_positions: 2       # limit BTC/ETH/altcoin concentration
+
+# ── Local LLM (Ollama) ────────────────────────────────────────────────────────
+llm:
+  provider: ollama            # ollama | openai | anthropic
+  base_url: http://localhost:11434
+  model: deepseek-r1:7b       # primary local model
+  fallback_model: llama3:8b   # fallback if primary unavailable
+  temperature: 0.1            # low temp = deterministic reasoning
+  max_tokens: 2048
+  timeout_seconds: 90
+  chain_of_thought: true      # use CoT prompting
+  structured_output: true     # request JSON-formatted reasoning
+
+# ── Exchange ──────────────────────────────────────────────────────────────────
+exchange:
+  id: binance                 # ccxt exchange id
+  sandbox: true               # use testnet
+  api_key: ""                 # or set AUTO_TRADER_EXCHANGE_API_KEY env var
+  api_secret: ""              # or set AUTO_TRADER_EXCHANGE_API_SECRET env var
+  rate_limit_ms: 500
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+data:
+  ohlcv_limit: 200            # candles per timeframe fetch
+  cache_ttl_seconds: 60       # OHLCV cache lifetime
+  news_enabled: false         # set true to pull CryptoPanic / RSS headlines
+  news_api_key: ""            # CryptoPanic API key
+  sentiment_lookback_hours: 24
+
+# ── Symbol Selector ───────────────────────────────────────────────────────────
+symbol_selector:
+  min_volume_usdt_24h: 50_000_000   # filter low-liquidity assets
+  min_atr_pct: 0.01                 # minimum ATR % (volatility floor)
+  max_atr_pct: 0.15                 # maximum ATR % (volatility ceiling)
+  top_n: 10                         # pass top-N symbols to analysis
+
+# ── Quant Analyst ─────────────────────────────────────────────────────────────
+quant:
+  indicators:
+    - rsi
+    - macd
+    - bbands
+    - ema_20
+    - ema_50
+    - ema_200
+    - atr
+    - volume_ma
+    - stochastic
+    - adx
+  rsi_period: 14
+  rsi_overbought: 70
+  rsi_oversold: 30
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+  bb_period: 20
+  bb_std: 2.0
+  adx_period: 14
+  adx_trend_threshold: 25
+
+# ── Decision Core ─────────────────────────────────────────────────────────────
+decision:
+  min_confidence: 0.65              # minimum fused confidence to trade
+  quant_weight: 0.40                # weight of quant signals
+  trend_weight: 0.20                # weight of LLM trend agent
+  setup_weight: 0.20                # weight of LLM setup agent
+  trigger_weight: 0.10              # weight of LLM trigger agent
+  sentiment_weight: 0.10            # weight of sentiment agent
+  adversarial_veto: true            # enable bear/bull adversarial debate
+  consensus_threshold: 0.60         # agent agreement threshold
+
+# ── Monitoring ────────────────────────────────────────────────────────────────
+monitoring:
+  log_level: INFO
+  log_file: ./logs/trader.log
+  db_path: ./data/trades.db
+  metrics_enabled: true
+  metrics_port: 8000
+  dashboard_refresh_seconds: 10
+  performance_window_days: 30
