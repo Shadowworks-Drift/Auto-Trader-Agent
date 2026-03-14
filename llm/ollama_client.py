@@ -259,4 +259,22 @@ def _extract_json(text: str) -> Optional[Dict[str, Any]]:
                             pass
                     logger.debug(f"_extract_json: unparseable block at [{start}:{i+1}]: {candidate[:120]!r}")
                     start = None
+    # Last resort: regex key-value extraction.
+    # Handles responses where the model wraps every answer inside a narrative key,
+    # e.g.  {"Here is my analysis:": ...} — scan for "field": value pairs directly.
+    _KV = re.compile(
+        r'"([\w_]+)"\s*:\s*("(?:[^"\\]|\\.)*"|-?\d+(?:\.\d+)?|true|false|null)',
+        re.IGNORECASE,
+    )
+    pairs = _KV.findall(text)
+    if pairs:
+        result: Dict[str, Any] = {}
+        for key, raw_val in pairs:
+            try:
+                result[key] = json.loads(raw_val)
+            except Exception:
+                result[key] = raw_val.strip('"')
+        if result:
+            logger.debug(f"_extract_json: used regex fallback, recovered {list(result.keys())}")
+            return result
     return None
