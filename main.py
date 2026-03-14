@@ -38,6 +38,7 @@ from loguru import logger
 
 from agents.decision_core import DecisionCore, TradeProposal
 from agents.quant_analyst import QuantAnalyst
+from agents.regime_detector import RegimeDetector
 from agents.risk_audit import RiskAudit, PortfolioState
 from agents.semantic_agents import TrendAgent, SetupAgent, TriggerAgent, SentimentAgent
 from agents.symbol_selector import SymbolSelector
@@ -94,6 +95,7 @@ class TradingOrchestrator:
         self.data_sync = DataSync(settings)
         self.symbol_selector = SymbolSelector(settings, self.data_sync)
         self.quant_analyst = QuantAnalyst(settings)
+        self.regime_detector = RegimeDetector()
 
         if use_llm:
             self.trend_agent = TrendAgent(settings, self.llm)
@@ -237,6 +239,14 @@ class TradingOrchestrator:
     async def _analyse_symbol(self, snapshot: MarketSnapshot) -> Optional[Dict[str, Any]]:
         symbol = snapshot.symbol
 
+        # ── Regime detection (gates entire pipeline) ───────────────────────
+        primary_tf = self.settings.trading.timeframes["primary"]
+        regime_result = None
+        if primary_tf in snapshot.ohlcv:
+            regime_result = self.regime_detector.detect(snapshot.ohlcv[primary_tf])
+            logger.info(f"[{symbol}] {regime_result.summary()}")
+            self.tracker.record_agent_confidence("regime", symbol, regime_result.confidence)
+
         # ── Quant analysis (always runs) ───────────────────────────────────
         quant_result = await self.quant_analyst.analyse(snapshot)
         if not quant_result.success:
@@ -261,7 +271,8 @@ class TradingOrchestrator:
 
             # ── Decision fusion ────────────────────────────────────────────
             proposal = await self.decision_core.decide(
-                snapshot, quant_result, trend_result, setup_result, trigger_result, sentiment_result
+                snapshot, quant_result, trend_result, setup_result, trigger_result, sentiment_result,
+                regime_result=regime_result,
             )
         else:
             # Quant-only fallback
