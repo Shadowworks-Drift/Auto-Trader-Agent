@@ -4,6 +4,7 @@ from .quant_analyst import QuantAnalyst, QuantSignal
 from .semantic_agents import TrendAgent, SetupAgent, TriggerAgent, SentimentAgent
 from .decision_core import DecisionCore, TradeProposal
 from .risk_audit import RiskAudit, RiskDecision
+from .regime_detector import RegimeDetector, RegimeResult
 
 __all__ = [
     "BaseAgent", "AgentResult",
@@ -12,4 +13,5 @@ __all__ = [
     "TrendAgent", "SetupAgent", "TriggerAgent", "SentimentAgent",
     "DecisionCore", "TradeProposal",
     "RiskAudit", "RiskDecision",
+    "RegimeDetector", "RegimeResult",
 ]

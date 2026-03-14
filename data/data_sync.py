@@ -14,6 +14,7 @@ import ccxt.async_support as ccxt
 from loguru import logger
 
 from config.settings import Settings
+from .alternative_data import AltDataFetcher
 from .market_data import Candle, MarketSnapshot, NewsItem, OHLCV
 
 
@@ -50,6 +51,9 @@ class DataSync:
         self.settings = settings
         self.cache = OHLCVCache(ttl_seconds=settings.data.cache_ttl_seconds)
         self._exchange: Optional[ccxt.Exchange] = None
+        self._alt_fetcher = AltDataFetcher(
+            coinglass_key=getattr(settings.data, "coinglass_api_key", ""),
+        )
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -96,12 +100,21 @@ class DataSync:
         if self.settings.data.news_enabled:
             news = await self._fetch_news(symbol)
 
-        return MarketSnapshot(
+        snapshot = MarketSnapshot(
             symbol=symbol,
             fetched_at=datetime.utcnow(),
             ohlcv=ohlcv_map,
             news=news,
         )
+
+        # Attach alternative data (always attempted — fails gracefully)
+        try:
+            alt_bundle = await self._alt_fetcher.fetch(symbol)
+            snapshot.attach_alt_data(alt_bundle)
+        except Exception as exc:
+            logger.debug(f"Alt data fetch skipped for {symbol}: {exc}")
+
+        return snapshot
 
     async def fetch_all_snapshots(self, symbols: List[str]) -> Dict[str, MarketSnapshot]:
         """Concurrently fetch snapshots for all symbols."""

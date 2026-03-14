@@ -20,6 +20,7 @@ from data.market_data import MarketSnapshot
 from llm.ollama_client import OllamaClient
 from llm.prompts import PromptLibrary
 from .base_agent import AgentResult
+from .regime_detector import RegimeResult, REGIME_WEIGHT_ADJUSTMENTS
 
 try:
     from rl.position_sizer import RLPositionSizer, SizerDecision
@@ -92,6 +93,7 @@ class DecisionCore:
         setup_result: AgentResult,
         trigger_result: AgentResult,
         sentiment_result: AgentResult,
+        regime_result: Optional[RegimeResult] = None,
     ) -> TradeProposal:
         t0 = time.perf_counter()
 
@@ -112,8 +114,25 @@ class DecisionCore:
                 reasoning="No directional consensus across agents.",
             )
 
-        # ── Step 2: fuse confidence scores ────────────────────────────────
-        score = self._fuse_scores(direction, quant_result, trend_result, setup_result, trigger_result, sentiment_result)
+        # ── Regime gate ───────────────────────────────────────────────────
+        if regime_result and not regime_result.is_tradeable:
+            return TradeProposal(
+                symbol=snapshot.symbol,
+                direction="none",
+                confidence=0.0,
+                entry_price=snapshot.current_price,
+                stop_loss=0.0,
+                take_profit=0.0,
+                position_size_pct=0.0,
+                regime=regime_result.regime,
+                reasoning=f"Regime gate blocked trade: {regime_result.reasoning}",
+            )
+
+        # ── Step 2: fuse confidence scores (regime-aware) ─────────────────
+        score = self._fuse_scores(
+            direction, quant_result, trend_result, setup_result, trigger_result, sentiment_result,
+            regime=regime_result,
+        )
 
         # ── Step 3: compute entry / SL / TP ───────────────────────────────
         price = snapshot.current_price
@@ -133,6 +152,10 @@ class DecisionCore:
             quant_result, trend_result, setup_result, trigger_result, sentiment_result,
             snapshot,
         )
+        # ── Step 5: position sizing (regime-adjusted) ─────────────────────
+        position_size_pct = self._size_position(score, entry, sl)
+        if regime_result:
+            position_size_pct *= regime_result.position_size_mult
 
         reasoning = self._build_reasoning(
             direction, score, quant_result, trend_result, setup_result, trigger_result, sentiment_result
@@ -153,6 +176,7 @@ class DecisionCore:
             stop_loss=round(sl, 8),
             take_profit=round(tp, 8),
             position_size_pct=round(position_size_pct, 4),
+            regime=regime_result.regime if regime_result else "unknown",
             agent_scores={
                 "quant": _dir_score(direction, quant_result),
                 "trend": _dir_score(direction, trend_result),
@@ -191,16 +215,34 @@ class DecisionCore:
         setup: AgentResult,
         trigger: AgentResult,
         sentiment: AgentResult,
+        regime: Optional[RegimeResult] = None,
     ) -> float:
         w = self.cfg
+        # Base weights
+        qw = w.quant_weight
+        trw = w.trend_weight
+        sw = w.setup_weight
+        trgw = w.trigger_weight
+        sentw = w.sentiment_weight
+
+        # Apply regime-conditional weight adjustments
+        if regime and regime.weight_adjustments:
+            adj = regime.weight_adjustments
+            # Quant sub-signals adjust via their indicator votes
+            qw   *= adj.get("ema_trend", 1.0) * 0.5 + adj.get("macd", 1.0) * 0.5
+            trw  *= adj.get("trend", 1.0)
+            sw   *= adj.get("setup", 1.0)
+            trgw *= adj.get("trigger", 1.0)
+            sentw *= adj.get("sentiment", 1.0)
+
         weighted = (
-            _dir_score(direction, quant) * w.quant_weight
-            + _dir_score(direction, trend) * w.trend_weight
-            + _dir_score(direction, setup) * w.setup_weight
-            + _dir_score(direction, trigger) * w.trigger_weight
-            + _dir_score(direction, sentiment) * w.sentiment_weight
+            _dir_score(direction, quant)    * qw
+            + _dir_score(direction, trend)  * trw
+            + _dir_score(direction, setup)  * sw
+            + _dir_score(direction, trigger) * trgw
+            + _dir_score(direction, sentiment) * sentw
         )
-        total_w = w.quant_weight + w.trend_weight + w.setup_weight + w.trigger_weight + w.sentiment_weight
+        total_w = qw + trw + sw + trgw + sentw
         return round(weighted / max(total_w, 1e-9), 4)
 
     def _compute_levels(

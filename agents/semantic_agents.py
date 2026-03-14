@@ -17,6 +17,7 @@ from loguru import logger
 
 from config.settings import Settings
 from data.market_data import MarketSnapshot
+from llm.finbert_client import FinBERTClient
 from llm.ollama_client import OllamaClient
 from llm.prompts import PromptLibrary
 from .base_agent import AgentResult, BaseAgent
@@ -178,21 +179,82 @@ class TriggerAgent(_LLMAgent):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class SentimentAgent(_LLMAgent):
-    """Interprets news and social signals to produce a sentiment score."""
+    """
+    Two-tier sentiment agent.
+
+    Tier 1 (fast, <50ms): FinBERT2 classifier on individual headlines
+    Tier 2 (slow, 2-15s): Ollama LLM for ambiguous cases and structured
+                          reasoning with alternative data
+
+    If FinBERT2 aggregate confidence > threshold AND |score| > ambiguity threshold,
+    returns immediately without calling Ollama (~60% of cases).
+    Otherwise escalates to full Ollama prompt for richer context integration.
+    """
 
     name = "SentimentAgent"
+    FAST_PATH_CONF_THRESHOLD = 0.70    # FinBERT must be this confident to skip Ollama
+    FAST_PATH_SCORE_THRESHOLD = 0.35   # |score| must exceed this to trust fast path
+
+    def __init__(self, settings: Settings, llm: OllamaClient, finbert: Optional[FinBERTClient] = None) -> None:
+        super().__init__(settings, llm)
+        self.finbert = finbert
 
     async def analyse(self, snapshot: MarketSnapshot) -> AgentResult:
         t0 = time.perf_counter()
         hours = self.settings.data.sentiment_lookback_hours
+
+        # ── Tier 1: FinBERT2 fast-path ────────────────────────────────────
+        finbert_score = None
+        if self.finbert and self.finbert.is_available() and snapshot.news:
+            headline_texts = [item.title for item in snapshot.news[:15]]
+            try:
+                scores = await self.finbert.score_headlines(headline_texts)
+                finbert_score = self.finbert.aggregate(scores)
+                logger.debug(
+                    f"FinBERT2 [{snapshot.symbol}]: {finbert_score.direction} "
+                    f"score={finbert_score.score:.3f} conf={finbert_score.confidence:.3f} "
+                    f"({finbert_score.elapsed_ms:.0f}ms)"
+                )
+                # Fast-path exit: confident and unambiguous
+                if (
+                    finbert_score.confidence >= self.FAST_PATH_CONF_THRESHOLD
+                    and abs(finbert_score.score) >= self.FAST_PATH_SCORE_THRESHOLD
+                    and snapshot.alt_composite_signal is None  # no alt data to integrate
+                ):
+                    direction = "long" if finbert_score.direction == "bullish" else \
+                                "short" if finbert_score.direction == "bearish" else "none"
+                    elapsed = (time.perf_counter() - t0) * 1000
+                    return self._make_result(snapshot.symbol, success=True, data={
+                        "sentiment": finbert_score.direction,
+                        "score": finbert_score.score,
+                        "confidence": finbert_score.confidence,
+                        "direction": direction,
+                        "momentum": "stable",
+                        "reasoning": f"FinBERT2 fast-path: {finbert_score.label} ({finbert_score.score:.3f})",
+                        "model_used": finbert_score.model_used,
+                    }, elapsed_ms=elapsed)
+            except Exception as exc:
+                logger.debug(f"FinBERT2 fast-path failed: {exc}")
+
+        # ── Tier 2: Ollama slow-path (full context) ───────────────────────
         headlines = snapshot.news_headlines_text()
+        alt_data_text = snapshot.alt_data_text() if hasattr(snapshot, "alt_data_text") else "N/A"
         social_signals = str(snapshot.social_signals) if snapshot.social_signals else "N/A"
+        alt_data_text = snapshot.alt_data_text()
+
+        # Inject FinBERT pre-score into context for Ollama
+        if finbert_score:
+            headlines = (
+                f"[FinBERT2 pre-score: {finbert_score.label} ({finbert_score.score:+.3f})]\n\n"
+                + headlines
+            )
 
         user_msg = PromptLibrary.render(
             PromptLibrary.SENTIMENT_ANALYSIS,
             symbol=snapshot.symbol,
             hours=str(hours),
             headlines=headlines,
+            alt_data=alt_data_text,
             social_signals=social_signals,
         )
 
@@ -200,13 +262,27 @@ class SentimentAgent(_LLMAgent):
             data = await self._ask(PromptLibrary.SYSTEM_SENTIMENT_AGENT, user_msg, snapshot.symbol)
             sentiment = data.get("sentiment", "neutral").lower()
             data["direction"] = "long" if sentiment == "bullish" else "short" if sentiment == "bearish" else "none"
+            data["model_used"] = "ollama"
+            if finbert_score:
+                data["finbert_pre_score"] = finbert_score.score
             elapsed = (time.perf_counter() - t0) * 1000
             return self._make_result(snapshot.symbol, success=True, data=data, elapsed_ms=elapsed)
         except Exception as exc:
             logger.error(f"SentimentAgent error for {snapshot.symbol}: {exc}")
+            # If FinBERT2 ran and we have a result, use it as fallback
+            if finbert_score:
+                direction = "long" if finbert_score.direction == "bullish" else \
+                            "short" if finbert_score.direction == "bearish" else "none"
+                return self._make_result(snapshot.symbol, success=True, data={
+                    "sentiment": finbert_score.direction,
+                    "score": finbert_score.score,
+                    "confidence": finbert_score.confidence * 0.7,  # penalise for LLM failure
+                    "direction": direction,
+                    "reasoning": f"FinBERT2 fallback (Ollama failed): {exc}",
+                    "model_used": "finbert2_fallback",
+                })
             return self._make_result(
-                snapshot.symbol,
-                success=False,
+                snapshot.symbol, success=False,
                 data={"direction": "none", "confidence": 0.0, "score": 0.0},
                 error=str(exc),
             )
