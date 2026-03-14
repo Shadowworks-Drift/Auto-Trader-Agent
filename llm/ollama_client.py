@@ -190,6 +190,8 @@ class OllamaClient:
 
 def _extract_json(text: str) -> Optional[Dict[str, Any]]:
     """Extract the first JSON object from an LLM response string."""
+    # Strip <think>...</think> blocks emitted by reasoning models (e.g. deepseek-r1)
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
     # Try direct parse first
     try:
         return json.loads(text.strip())
