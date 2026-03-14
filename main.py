@@ -89,6 +89,11 @@ class TradingOrchestrator:
         self._loop_count = 0
         self._errors = 0
         self._last_signals: List[Dict[str, Any]] = []
+        self._recent_decisions: List[Dict[str, Any]] = []
+        self._prev_prices: Dict[str, float] = {}
+        self._next_cycle_at: float = 0.0
+        self._last_perf: Dict[str, Any] = {}
+        self._last_prices: Dict[str, float] = {}
 
         # ── Component initialisation ─────────────────────────────────────
         self.llm = OllamaClient(
@@ -166,28 +171,42 @@ class TradingOrchestrator:
     # ── Main loop ─────────────────────────────────────────────────────────────
 
     async def run_loop(self, once: bool = False) -> None:
-        """Main trading loop."""
+        """Main trading loop — runs inside Dashboard.live() context."""
         interval = self.settings.trading.loop_interval_seconds
-        while self._running:
-            loop_start = time.perf_counter()
-            try:
-                await self._cycle()
-            except KeyboardInterrupt:
-                break
-            except Exception as exc:
-                self._errors += 1
-                logger.error(f"Loop error: {exc}", exc_info=True)
+        with self.dashboard.live():
+            while self._running:
+                loop_start = time.perf_counter()
+                self._next_cycle_at = loop_start + interval
+                try:
+                    await self._cycle()
+                except KeyboardInterrupt:
+                    break
+                except Exception as exc:
+                    self._errors += 1
+                    logger.error(f"Loop error: {exc}", exc_info=True)
 
-            elapsed = time.perf_counter() - loop_start
-            self.tracker.record_loop_duration(elapsed)
+                elapsed = time.perf_counter() - loop_start
+                self.tracker.record_loop_duration(elapsed)
 
-            if once:
-                break
+                if once:
+                    break
 
-            sleep_time = max(0, interval - elapsed)
-            if sleep_time > 0:
-                logger.debug(f"Sleeping {sleep_time:.0f}s until next cycle...")
-                await asyncio.sleep(sleep_time)
+                sleep_time = max(0, interval - elapsed)
+                if sleep_time > 0:
+                    # Tick the countdown in the dashboard while sleeping
+                    tick = min(1.0, sleep_time)
+                    slept = 0.0
+                    while slept < sleep_time and self._running:
+                        await asyncio.sleep(tick)
+                        slept += tick
+                        remaining = max(0.0, sleep_time - slept)
+                        self.dashboard.update(
+                            self._build_state(
+                                self._last_perf,
+                                self._last_prices,
+                                next_cycle_in=remaining,
+                            )
+                        )
 
     # ── Trading cycle ─────────────────────────────────────────────────────────
 
@@ -231,6 +250,10 @@ class TradingOrchestrator:
                 signal = await self._analyse_symbol(snapshot)
                 if signal:
                     cycle_signals.append(signal)
+                    # Append to scrolling decision log
+                    self._recent_decisions.append(signal)
+                    if len(self._recent_decisions) > 50:
+                        self._recent_decisions = self._recent_decisions[-50:]
             except Exception as exc:
                 logger.error(f"Analysis failed for {symbol}: {exc}", exc_info=True)
                 self._errors += 1
@@ -249,7 +272,38 @@ class TradingOrchestrator:
             sharpe=perf.get("sharpe_ratio", 0),
             win_rate=perf.get("win_rate", 0),
         )
-        self.dashboard.update(self._build_state(perf, prices))
+
+        # Build closed trades list for history panel
+        recent_trades = []
+        if hasattr(self.execution, "paper") and self.execution.paper:
+            paper_trades = getattr(self.execution.paper, "trades", [])
+            for t in paper_trades[-20:]:
+                recent_trades.append({
+                    "symbol":      t.symbol,
+                    "direction":   t.direction,
+                    "entry_price": t.entry_price,
+                    "exit_price":  t.exit_price,
+                    "pnl":         t.pnl,
+                    "pnl_pct":     t.pnl_pct,
+                    "exit_reason": t.exit_reason,
+                    "opened_at":   t.opened_at,
+                    "closed_at":   t.closed_at,
+                })
+
+        # Latest signal for the agent scores panel
+        latest = cycle_signals[-1] if cycle_signals else {}
+        self.dashboard.update(
+            self._build_state(
+                perf,
+                prices,
+                recent_trades=recent_trades,
+                latest=latest,
+                next_cycle_in=0.0,
+            )
+        )
+        self._last_perf   = perf
+        self._prev_prices = self._last_prices   # prev = last cycle's prices
+        self._last_prices = prices
 
     async def _analyse_symbol(self, snapshot: MarketSnapshot) -> Optional[Dict[str, Any]]:
         symbol = snapshot.symbol
@@ -310,6 +364,7 @@ class TradingOrchestrator:
             agent_signals_text = quant_summary
             risk_decision = await self.risk_audit.audit(proposal, agent_signals_text)
             self.dashboard.print_decision(proposal, risk_decision)
+            _executed = "filled" if risk_decision.approved else "vetoed"
 
             # ── Execute ────────────────────────────────────────────────────
             result = await self.execution.execute(proposal, risk_decision, snapshot.current_price)
@@ -317,27 +372,57 @@ class TradingOrchestrator:
                 f"Order [{symbol}]: status={result.status} order_id={result.order_id}"
             )
         else:
+            _executed = ""
             logger.info(
                 f"[{symbol}] No trade — {proposal.direction} confidence={proposal.confidence:.2f} "
                 f"< min={self.settings.decision.min_confidence}"
             )
 
+        # Collect vision patterns if available
+        vision_patterns: List[str] = []
+        if self.use_llm and vision_result and vision_result.success:
+            vision_patterns = vision_result.data.get("patterns", []) if vision_result.data else []
+
         return {
-            "symbol": symbol,
+            "symbol":    symbol,
             "direction": proposal.direction,
             "confidence": proposal.confidence,
+            "agent_scores": proposal.agent_scores,
+            "regime":    proposal.regime,
+            "patterns":  vision_patterns,
+            "timestamp": datetime.now(timezone.utc),
+            "executed":  _executed,
         }
 
-    def _build_state(self, perf: Dict[str, Any], prices: Dict[str, float]) -> Dict[str, Any]:
+    def _build_state(
+        self,
+        perf: Dict[str, Any],
+        prices: Dict[str, float],
+        recent_trades: Optional[List[Dict[str, Any]]] = None,
+        latest: Optional[Dict[str, Any]] = None,
+        next_cycle_in: float = 0.0,
+    ) -> Dict[str, Any]:
+        latest = latest or (self._recent_decisions[-1] if self._recent_decisions else {})
         return {
-            "mode": self.settings.trading.mode,
-            "llm_model": self.settings.llm.model,
-            "performance": perf,
-            "positions": self.execution.get_open_positions(),
-            "last_signals": self._last_signals,
-            "loop_count": self._loop_count,
-            "last_loop_at": datetime.now(timezone.utc).strftime("%H:%M:%S"),
-            "errors": self._errors,
+            "mode":             self.settings.trading.mode,
+            "llm_model":        self.settings.llm.model,
+            "vision_model":     self.settings.llm.vision_model if self.settings.llm.vision_enabled else "",
+            "performance":      perf,
+            "positions":        self.execution.get_open_positions(),
+            "prices":           prices,
+            "prev_prices":      self._prev_prices,
+            "last_signals":     self._last_signals,
+            "recent_decisions": list(self._recent_decisions),
+            "recent_trades":    recent_trades or [],
+            "loop_count":       self._loop_count,
+            "last_loop_at":     datetime.now(timezone.utc).strftime("%H:%M:%S"),
+            "errors":           self._errors,
+            "next_cycle_in":    next_cycle_in,
+            # Latest signal for agent scores panel
+            "agent_scores":     latest.get("agent_scores", {}),
+            "latest_symbol":    latest.get("symbol", ""),
+            "latest_direction": latest.get("direction", "none"),
+            "latest_regime":    latest.get("regime", ""),
         }
 
 
