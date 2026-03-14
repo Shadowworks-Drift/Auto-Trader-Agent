@@ -52,6 +52,9 @@ class LLMConfig(BaseModel):
     timeout_seconds: int = 90
     chain_of_thought: bool = True
     structured_output: bool = True
+    # Vision / chart agent
+    vision_model: str = "llava:7b"       # ollama pull llava:7b  (or moondream:latest)
+    vision_enabled: bool = True          # set false to skip chart rendering entirely
 
 
 class ExchangeConfig(BaseModel):
@@ -93,11 +96,12 @@ class QuantConfig(BaseModel):
 
 class DecisionConfig(BaseModel):
     min_confidence: float = 0.65
-    quant_weight: float = 0.40
-    trend_weight: float = 0.20
+    quant_weight: float = 0.35
+    trend_weight: float = 0.15
     setup_weight: float = 0.20
     trigger_weight: float = 0.10
     sentiment_weight: float = 0.10
+    vision_weight: float = 0.10          # chart vision agent (0.0 = disabled)
     adversarial_veto: bool = True
     consensus_threshold: float = 0.60
 

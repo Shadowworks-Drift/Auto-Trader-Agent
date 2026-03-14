@@ -24,39 +24,44 @@ Universe of symbols
 │    DataSync     │  Async CCXT → multi-timeframe OHLCV + news (CryptoPanic)
 └────────┬────────┘
          │  MarketSnapshot
-         ├─────────────────────────────────────┐
-         ▼                                     ▼
-┌─────────────────┐                  ┌──────────────────────┐
-│  QuantAnalyst   │                  │   SentimentAgent     │
-│  RSI/MACD/BB/   │                  │   LLM · news & social│
-│  EMA/ATR/ADX/   │                  └──────────┬───────────┘
-│  Stochastic     │                             │
-└────────┬────────┘                             │
-         │  QuantSignal                         │
-         ▼                                      │
-┌─────────────────┐                             │
-│   TrendAgent    │  LLM · macro trend          │
-└────────┬────────┘  (context + primary TF)     │
-         │                                      │
-         ▼                                      │
-┌─────────────────┐                             │
-│   SetupAgent    │  LLM · setup quality        │
-└────────┬────────┘                             │
-         │                                      │
-         ▼                                      │
-┌─────────────────┐                             │
-│  TriggerAgent   │  LLM · entry trigger        │
-└────────┬────────┘  (entry TF)                 │
-         │                                      │
-         └──────────────┬─────────────────────┘
-                        ▼
-              ┌──────────────────┐
-              │  DecisionCore    │  Weighted fusion + Adversarial Debate
-              │  (Bear/Bull LLM  │  (Bear advocate challenges long,
-              │   Advocates)     │   Bull advocate challenges short)
-              └────────┬─────────┘
-                       │  TradeProposal
-                       ▼
+         ├──────────────────────────────────────────┐
+         ▼                                          ▼
+┌─────────────────┐                       ┌──────────────────────┐
+│  QuantAnalyst   │                       │   SentimentAgent     │
+│  RSI/MACD/BB/   │                       │   LLM · news & social│
+│  EMA/ATR/ADX/   │                       └──────────┬───────────┘
+│  Stochastic     │                                  │
+└────────┬────────┘                                  │
+         │  QuantSignal                              │
+         ▼                                           │
+┌─────────────────┐                                  │
+│   TrendAgent    │  LLM · macro trend               │
+└────────┬────────┘  (context + primary TF)          │
+         │                                           │
+         ▼                                           │
+┌─────────────────┐                                  │
+│   SetupAgent    │  LLM · setup quality             │
+└────────┬────────┘                                  │
+         │                                           │
+         ▼                                           │
+┌─────────────────┐     ┌──────────────────────────┐ │
+│  TriggerAgent   │     │   ChartVisionAgent       │ │
+└────────┬────────┘     │   Vision LLM · rendered  │ │
+         │              │   candlestick PNG         │ │
+         │              │   patterns / S&R levels   │ │
+         │              └──────────────┬────────────┘ │
+         │                             │              │
+         └─────────────────┬───────────┘──────────────┘
+                           ▼
+              ┌──────────────────────────┐
+              │       DecisionCore       │  6-agent weighted fusion
+              │  quant 35% · trend 15%   │  + Adversarial Bear/Bull Debate
+              │  setup 20% · trigger 10% │  (Bear challenges long,
+              │  sentiment 10%           │   Bull challenges short)
+              │  vision 10%              │
+              └────────────┬─────────────┘
+                           │  TradeProposal
+                           ▼
               ┌──────────────────┐
               │   RiskAudit      │  Hard rules + optional LLM narrative audit
               │  · SL direction  │  · Portfolio drawdown breaker
@@ -82,7 +87,8 @@ Universe of symbols
 |---|---|
 | **LLM** | Ollama (local), OpenAI-compatible, fallback model, CoT prompting, structured JSON output |
 | **Agents** | Symbol Selector, Quant Analyst, Trend/Setup/Trigger/Sentiment Semantic Agents |
-| **Decision** | Adversarial Bear/Bull debate, weighted fusion, consensus threshold |
+| **Vision** | ChartVisionAgent — renders candlestick PNG → local vision LLM (llava/moondream) for chart pattern recognition |
+| **Decision** | 6-agent weighted fusion, Adversarial Bear/Bull debate, consensus threshold |
 | **Risk** | SL direction correction, R:R gate, drawdown circuit-breaker, daily loss circuit-breaker, correlated position limit |
 | **Indicators** | RSI, MACD, Bollinger Bands, EMA (20/50/200), ATR, Volume MA, Stochastic, ADX |
 | **Execution** | Paper (SQLite-persisted), Live (CCXT), SL/TP bracket orders |
@@ -101,23 +107,31 @@ bash scripts/setup.sh
 source .venv/bin/activate
 ```
 
-### 2. Install Ollama and pull a model
+### 2. Install Ollama and pull models
 
 ```bash
 # Install Ollama (Linux/macOS)
 curl -fsSL https://ollama.ai/install.sh | sh
 
-# Pull recommended models
+# Pull recommended models (text + vision)
 bash scripts/pull_models.sh
 
 # Start Ollama server
 ollama serve
 ```
 
-**Minimum hardware:**
+**Text models (reasoning):**
 - 8 GB RAM → `deepseek-r1:7b` or `llama3:8b`
 - 16 GB RAM → `deepseek-r1:14b`
 - GPU (12 GB VRAM) → `llama3:70b`
+
+**Vision model (chart pattern recognition) — pick one:**
+```bash
+ollama pull llava:7b        # 4.7 GB — recommended, best pattern accuracy
+ollama pull moondream:latest  # 1.7 GB — faster, lower VRAM requirement
+```
+> The vision agent degrades gracefully — if no vision model is pulled it logs a WARNING and the
+> other five agents continue normally. Set `llm.vision_enabled: false` in config to disable it.
 
 ### 3. Configure
 
@@ -138,6 +152,11 @@ trading:
 llm:
   model: deepseek-r1:7b
   base_url: http://localhost:11434
+  vision_model: llava:7b     # vision model for chart pattern recognition
+  vision_enabled: true       # set false to disable chart agent
+
+decision:
+  vision_weight: 0.10        # set 0.0 to exclude vision from fusion
 
 exchange:
   id: binance
@@ -193,13 +212,15 @@ Auto-Trader-Agent/
 │   └── prompts.py               # All agent system/user prompt templates
 ├── data/
 │   ├── market_data.py           # Domain models (OHLCV, Candle, Snapshot)
+│   ├── chart_renderer.py        # mplfinance candlestick PNG renderer (vision agent)
 │   └── data_sync.py             # CCXT-based async data fetcher + cache
 ├── agents/
 │   ├── base_agent.py            # Abstract base class
 │   ├── symbol_selector.py       # Volume + ATR + momentum screener
 │   ├── quant_analyst.py         # Technical indicator computation + voting
 │   ├── semantic_agents.py       # TrendAgent, SetupAgent, TriggerAgent, SentimentAgent
-│   ├── decision_core.py         # Signal fusion + adversarial debate
+│   ├── chart_vision_agent.py    # ChartVisionAgent — visual pattern recognition via vision LLM
+│   ├── decision_core.py         # 6-agent signal fusion + adversarial debate
 │   └── risk_audit.py            # Hard rules + LLM narrative risk audit
 ├── execution/
 │   ├── paper_trading.py         # SQLite-persisted paper simulator
@@ -236,6 +257,8 @@ See `config/default_config.yaml` for all options. Key sections:
 | `fallback_model` | `llama3:8b` | Used if primary fails |
 | `temperature` | `0.1` | Low = deterministic |
 | `chain_of_thought` | `true` | Enable CoT prompting |
+| `vision_model` | `llava:7b` | Vision model for chart agent (`ollama pull llava:7b`) |
+| `vision_enabled` | `true` | Set `false` to skip chart rendering entirely |
 
 ### `risk`
 | Key | Default | Description |
@@ -250,7 +273,12 @@ See `config/default_config.yaml` for all options. Key sections:
 | Key | Default | Description |
 |---|---|---|
 | `min_confidence` | `0.65` | Minimum fused confidence |
-| `quant_weight` | `0.40` | Quant analyst contribution |
+| `quant_weight` | `0.35` | Quant analyst contribution |
+| `trend_weight` | `0.15` | Trend agent contribution |
+| `setup_weight` | `0.20` | Setup agent contribution |
+| `trigger_weight` | `0.10` | Trigger agent contribution |
+| `sentiment_weight` | `0.10` | Sentiment agent contribution |
+| `vision_weight` | `0.10` | Chart vision agent contribution (set `0.0` to exclude) |
 | `adversarial_veto` | `true` | Enable bear/bull debate |
 
 ---
@@ -268,8 +296,54 @@ AUTO_TRADER_TRADING_MODE=live
 
 ---
 
+## Chart Vision Agent
+
+The `ChartVisionAgent` renders a live candlestick chart (primary timeframe, last 80 candles, EMA
+20/50 overlay + volume subplot) to a PNG in memory, then sends it to a local Ollama vision model.
+
+**What the vision model detects:**
+
+| Category | Examples |
+|---|---|
+| Chart patterns | Head & shoulders, double top/bottom, ascending/descending/symmetrical triangle, bull/bear flag, bull/bear pennant, rising/falling wedge, cup & handle |
+| Candlestick patterns | Engulfing (bull/bear), hammer, shooting star, doji, morning/evening star |
+| Market structure | Breakout, breakdown, consolidation box |
+| Volume analysis | Volume confirmation or divergence |
+| Key levels | Support and resistance derived visually |
+
+**Output added to `TradeProposal.agent_scores`:**
+```json
+{
+  "vision": 0.72,
+  "...": "other agents"
+}
+```
+
+**Enable / disable:**
+```yaml
+# config/config.yaml
+llm:
+  vision_model: llava:7b   # or moondream:latest
+  vision_enabled: true     # false = skip entirely
+
+decision:
+  vision_weight: 0.10      # 0.0 = exclude from fusion but still run
+```
+
+**Pull a vision model:**
+```bash
+ollama pull llava:7b          # recommended (4.7 GB)
+ollama pull moondream:latest  # lightweight alternative (1.7 GB)
+```
+
+> If the vision model is not available, the agent returns `success=False`, its weight is
+> zeroed out of the fusion, and a clear WARNING is logged — the other five agents are unaffected.
+
+---
+
 ## Recommended Models
 
+### Text (reasoning) models
 | Model | RAM | Quality | Use case |
 |---|---|---|---|
 | `deepseek-r1:7b` | 8 GB | ★★★★☆ | **Recommended default** |
@@ -277,6 +351,12 @@ AUTO_TRADER_TRADING_MODE=live
 | `mistral:7b` | 8 GB | ★★★☆☆ | Fast, lightweight |
 | `deepseek-r1:14b` | 16 GB | ★★★★★ | Higher accuracy |
 | `llama3:70b` | GPU 24 GB | ★★★★★ | Best quality |
+
+### Vision models (chart pattern recognition)
+| Model | Size | Quality | Notes |
+|---|---|---|---|
+| `llava:7b` | 4.7 GB | ★★★★☆ | **Recommended** — best chart accuracy |
+| `moondream:latest` | 1.7 GB | ★★★☆☆ | Lightweight, good for low-VRAM systems |
 
 ---
 

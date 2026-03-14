@@ -36,6 +36,7 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
+from agents.chart_vision_agent import ChartVisionAgent
 from agents.decision_core import DecisionCore, TradeProposal
 from agents.quant_analyst import QuantAnalyst
 from agents.regime_detector import RegimeDetector
@@ -94,6 +95,7 @@ class TradingOrchestrator:
             base_url=settings.llm.base_url,
             model=settings.llm.model,
             fallback_model=settings.llm.fallback_model,
+            vision_model=settings.llm.vision_model,
             temperature=settings.llm.temperature,
             max_tokens=settings.llm.max_tokens,
             timeout=float(settings.llm.timeout_seconds),
@@ -113,12 +115,14 @@ class TradingOrchestrator:
             self.setup_agent = SetupAgent(settings, self.llm)
             self.trigger_agent = TriggerAgent(settings, self.llm)
             self.sentiment_agent = SentimentAgent(settings, self.llm)
+            self.chart_vision_agent = ChartVisionAgent(settings, self.llm)
             self.decision_core = DecisionCore(settings, self.llm, rl_sizer=self.rl_sizer)
         else:
             self.trend_agent = None
             self.setup_agent = None
             self.trigger_agent = None
             self.sentiment_agent = None
+            self.chart_vision_agent = None
             self.decision_core = None
 
         self.execution = ExecutionEngine(settings)
@@ -274,6 +278,15 @@ class TradingOrchestrator:
             trigger_result = await self.trigger_agent.analyse(snapshot, setup_result)
             sentiment_result = await self.sentiment_agent.analyse(snapshot)
 
+            # ── Vision agent (runs concurrently with sentiment; graceful skip) ──
+            vision_result = None
+            if self.chart_vision_agent and self.settings.llm.vision_enabled:
+                vision_result = await self.chart_vision_agent.analyse(snapshot, quant_summary)
+                self.tracker.record_agent_confidence(
+                    "vision", symbol,
+                    vision_result.confidence if vision_result.success else 0.0,
+                )
+
             for agent_name, result in [
                 ("trend", trend_result), ("setup", setup_result),
                 ("trigger", trigger_result), ("sentiment", sentiment_result)
@@ -284,6 +297,7 @@ class TradingOrchestrator:
             proposal = await self.decision_core.decide(
                 snapshot, quant_result, trend_result, setup_result, trigger_result, sentiment_result,
                 regime_result=regime_result,
+                vision_result=vision_result,
             )
         else:
             # Quant-only fallback

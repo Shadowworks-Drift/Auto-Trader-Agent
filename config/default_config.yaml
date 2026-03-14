@@ -44,6 +44,9 @@ llm:
   timeout_seconds: 90
   chain_of_thought: true      # use CoT prompting
   structured_output: true     # request JSON-formatted reasoning
+  # Chart Vision Agent — visual candlestick pattern recognition
+  vision_model: llava:7b      # ollama pull llava:7b  (or moondream:latest, ~1.7 GB)
+  vision_enabled: true        # set false to skip chart rendering entirely
 
 # ── Exchange ──────────────────────────────────────────────────────────────────
 exchange:
@@ -95,11 +98,12 @@ quant:
 # ── Decision Core ─────────────────────────────────────────────────────────────
 decision:
   min_confidence: 0.65              # minimum fused confidence to trade
-  quant_weight: 0.40                # weight of quant signals
-  trend_weight: 0.20                # weight of LLM trend agent
+  quant_weight: 0.35                # weight of quant signals
+  trend_weight: 0.15                # weight of LLM trend agent
   setup_weight: 0.20                # weight of LLM setup agent
   trigger_weight: 0.10              # weight of LLM trigger agent
   sentiment_weight: 0.10            # weight of sentiment agent
+  vision_weight: 0.10               # weight of chart vision agent (0.0 = disabled)
   adversarial_veto: true            # enable bear/bull adversarial debate
   consensus_threshold: 0.60         # agent agreement threshold
 
