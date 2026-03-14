@@ -63,8 +63,8 @@ def render_chart(
     ema50 = close.ewm(span=50, adjust=False).mean()
 
     apds = [
-        mpf.make_addplot(ema20, color="#f0a500", linewidth=1.2, label="EMA20"),
-        mpf.make_addplot(ema50, color="#3a9bd5", linewidth=1.2, label="EMA50"),
+        mpf.make_addplot(ema20, color="#f0a500", label="EMA20"),
+        mpf.make_addplot(ema50, color="#3a9bd5", label="EMA50"),
     ]
 
     buf = io.BytesIO()
