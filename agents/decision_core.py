@@ -146,14 +146,12 @@ class DecisionCore:
             )
             score = max(0.0, score - adv_discount)
 
-        # ── Step 5: position sizing ────────────────────────────────────────
+        # ── Step 5: position sizing (regime-adjusted) ─────────────────────
         position_size_pct, sizing_method = self._size_position(
             score, entry, sl,
             quant_result, trend_result, setup_result, trigger_result, sentiment_result,
             snapshot,
         )
-        # ── Step 5: position sizing (regime-adjusted) ─────────────────────
-        position_size_pct = self._size_position(score, entry, sl)
         if regime_result:
             position_size_pct *= regime_result.position_size_mult
 
@@ -299,8 +297,8 @@ class DecisionCore:
                     trigger_data=trigger_result.data,
                     sentiment_data=sentiment_result.data,
                     portfolio_info={
-                        "funding_rate": snapshot.alt_data.funding_rates[0].rate_8h
-                        if hasattr(snapshot, "alt_data") and snapshot.alt_data and snapshot.alt_data.funding_rates
+                        "funding_rate": snapshot.alt_data.funding.rate
+                        if hasattr(snapshot, "alt_data") and snapshot.alt_data and snapshot.alt_data.funding
                         else 0.0,
                         "fear_greed": snapshot.alt_data.fear_greed.value
                         if hasattr(snapshot, "alt_data") and snapshot.alt_data and snapshot.alt_data.fear_greed
