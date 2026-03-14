@@ -30,7 +30,7 @@ import asyncio
 import signal
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -189,7 +189,7 @@ class TradingOrchestrator:
 
     async def _cycle(self) -> None:
         self._loop_count += 1
-        logger.info(f"═══ Cycle #{self._loop_count} — {datetime.utcnow().strftime('%H:%M:%S UTC')} ═══")
+        logger.info(f"═══ Cycle #{self._loop_count} — {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')} ═══")
 
         symbols = self.settings.trading.symbols
 
@@ -322,7 +322,7 @@ class TradingOrchestrator:
             "positions": self.execution.get_open_positions(),
             "last_signals": self._last_signals,
             "loop_count": self._loop_count,
-            "last_loop_at": datetime.utcnow().strftime("%H:%M:%S"),
+            "last_loop_at": datetime.now(timezone.utc).strftime("%H:%M:%S"),
             "errors": self._errors,
         }
 
