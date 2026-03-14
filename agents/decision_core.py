@@ -22,6 +22,12 @@ from llm.prompts import PromptLibrary
 from .base_agent import AgentResult
 from .regime_detector import RegimeResult, REGIME_WEIGHT_ADJUSTMENTS
 
+try:
+    from rl.position_sizer import RLPositionSizer, SizerDecision
+    RL_AVAILABLE = True
+except ImportError:
+    RL_AVAILABLE = False
+
 
 @dataclass
 class TradeProposal:
@@ -35,6 +41,7 @@ class TradeProposal:
     agent_scores: Dict[str, float] = field(default_factory=dict)
     reasoning: str = ""
     adversarial_summary: str = ""
+    sizing_method: str = "kelly_lite"  # "rl_ppo" | "half_kelly" | "kelly_lite"
     regime: str = "unknown"
     timestamp: datetime = field(default_factory=datetime.utcnow)
 
@@ -66,11 +73,17 @@ class DecisionCore:
       quant   40%  |  trend  20%  |  setup  20%  |  trigger  10%  |  sentiment  10%
     """
 
-    def __init__(self, settings: Settings, llm: OllamaClient) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        llm: OllamaClient,
+        rl_sizer: Optional["RLPositionSizer"] = None,
+    ) -> None:
         self.settings = settings
         self.cfg = settings.decision
         self.risk_cfg = settings.risk
         self.llm = llm
+        self.rl_sizer = rl_sizer  # Optional RL position sizer
 
     async def decide(
         self,
@@ -133,6 +146,12 @@ class DecisionCore:
             )
             score = max(0.0, score - adv_discount)
 
+        # ── Step 5: position sizing ────────────────────────────────────────
+        position_size_pct, sizing_method = self._size_position(
+            score, entry, sl,
+            quant_result, trend_result, setup_result, trigger_result, sentiment_result,
+            snapshot,
+        )
         # ── Step 5: position sizing (regime-adjusted) ─────────────────────
         position_size_pct = self._size_position(score, entry, sl)
         if regime_result:
@@ -167,6 +186,7 @@ class DecisionCore:
             },
             reasoning=reasoning,
             adversarial_summary=adversarial_summary,
+            sizing_method=sizing_method,
         )
 
     # ── Internal helpers ──────────────────────────────────────────────────────
@@ -255,11 +275,54 @@ class DecisionCore:
 
         return entry, sl, tp
 
-    def _size_position(self, confidence: float, entry: float, sl: float) -> float:
-        """Kelly-lite fractional position sizing."""
+    def _size_position(
+        self,
+        confidence: float,
+        entry: float,
+        sl: float,
+        quant_result: AgentResult,
+        trend_result: AgentResult,
+        setup_result: AgentResult,
+        trigger_result: AgentResult,
+        sentiment_result: AgentResult,
+        snapshot: "MarketSnapshot",
+    ) -> tuple:
+        """Position sizing via RL agent (if loaded) or Kelly-lite fallback."""
         base_size = self.settings.trading.position_size_pct
-        # Scale by confidence (cap at base_size)
-        return min(base_size * confidence, base_size)
+
+        if RL_AVAILABLE and self.rl_sizer is not None:
+            try:
+                decision = self.rl_sizer.decide_from_dict(
+                    quant_data=quant_result.data,
+                    trend_data=trend_result.data,
+                    setup_data=setup_result.data,
+                    trigger_data=trigger_result.data,
+                    sentiment_data=sentiment_result.data,
+                    portfolio_info={
+                        "funding_rate": snapshot.alt_data.funding_rates[0].rate_8h
+                        if hasattr(snapshot, "alt_data") and snapshot.alt_data and snapshot.alt_data.funding_rates
+                        else 0.0,
+                        "fear_greed": snapshot.alt_data.fear_greed.value
+                        if hasattr(snapshot, "alt_data") and snapshot.alt_data and snapshot.alt_data.fear_greed
+                        else 50,
+                        "drawdown": 0.0,
+                        "daily_pnl_pct": 0.0,
+                        "open_count": 0,
+                        "max_positions": self.settings.risk.max_open_positions
+                        if hasattr(self.settings.risk, "max_open_positions") else 3,
+                    },
+                )
+                logger.debug(
+                    f"RL sizer [{snapshot.symbol}]: size={decision.position_size_pct:.4f} "
+                    f"method={decision.method} raw={decision.raw_action:.3f}"
+                )
+                return decision.position_size_pct, decision.method
+            except Exception as exc:
+                logger.warning(f"RL sizer failed, using Kelly-lite: {exc}")
+
+        # Kelly-lite fallback
+        size = min(base_size * confidence, base_size)
+        return size, "kelly_lite"
 
     async def _run_adversarial(
         self,

@@ -51,6 +51,12 @@ from monitoring.dashboard import Dashboard
 from monitoring.performance_tracker import PerformanceTracker
 from utils.logger import setup_logger
 
+try:
+    from rl.position_sizer import RLPositionSizer
+    RL_AVAILABLE = True
+except ImportError:
+    RL_AVAILABLE = False
+
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
@@ -97,12 +103,17 @@ class TradingOrchestrator:
         self.quant_analyst = QuantAnalyst(settings)
         self.regime_detector = RegimeDetector()
 
+        # ── Optional RL position sizer ────────────────────────────────────
+        self.rl_sizer = None
+        if RL_AVAILABLE:
+            self.rl_sizer = RLPositionSizer.from_model(max_position_size=settings.trading.position_size_pct)
+
         if use_llm:
             self.trend_agent = TrendAgent(settings, self.llm)
             self.setup_agent = SetupAgent(settings, self.llm)
             self.trigger_agent = TriggerAgent(settings, self.llm)
             self.sentiment_agent = SentimentAgent(settings, self.llm)
-            self.decision_core = DecisionCore(settings, self.llm)
+            self.decision_core = DecisionCore(settings, self.llm, rl_sizer=self.rl_sizer)
         else:
             self.trend_agent = None
             self.setup_agent = None
