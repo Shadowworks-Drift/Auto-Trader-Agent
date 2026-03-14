@@ -153,25 +153,40 @@ Respond with this JSON schema:
 """)
 
     SENTIMENT_ANALYSIS = Template("""\
-Analyse the following news headlines and social signals for $symbol over the last $hours hours.
+Analyse the following data for $symbol over the last $hours hours to determine market sentiment.
 
-## Headlines
+## News Headlines
 $headlines
+
+## Alternative Market Data (STRUCTURED — use these numbers directly in your reasoning)
+$alt_data
 
 ## Social Signals
 $social_signals
 
+## Interpretation Guide
+- Fear & Greed < 20 = extreme fear → contrarian BUY signal
+- Fear & Greed > 80 = extreme greed → contrarian SELL signal
+- Funding Rate > +0.05% annualised = crowded longs → bearish contrarian
+- Funding Rate < -0.02% annualised = crowded shorts → bullish contrarian
+- OI Change > +5% = new money entering the market
+- Liquidation Ratio > 3 = short squeeze in progress (bullish)
+- Liquidation Ratio < 0.33 = long liquidation cascade (bearish)
+
 ## Task
-1. Overall sentiment direction
+1. Overall sentiment direction incorporating ALL data above
 2. Key catalysts (positive and negative)
 3. Sentiment momentum (improving / deteriorating / stable)
+4. Identify if any contrarian extreme readings override the primary trend
 
 Respond with this JSON schema:
 {
   "sentiment": "bullish|bearish|neutral",
   "score": <-1.0 to 1.0>,
   "momentum": "improving|deteriorating|stable",
+  "contrarian_extreme": true|false,
   "key_catalysts": {"positive": ["<str>",...], "negative": ["<str>",...]},
+  "alt_data_summary": "<one sentence on what the structured numbers imply>",
   "reasoning": "<concise chain-of-thought>",
   "confidence": <0.0-1.0>
 }

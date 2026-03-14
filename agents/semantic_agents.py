@@ -187,12 +187,14 @@ class SentimentAgent(_LLMAgent):
         hours = self.settings.data.sentiment_lookback_hours
         headlines = snapshot.news_headlines_text()
         social_signals = str(snapshot.social_signals) if snapshot.social_signals else "N/A"
+        alt_data_text = snapshot.alt_data_text()
 
         user_msg = PromptLibrary.render(
             PromptLibrary.SENTIMENT_ANALYSIS,
             symbol=snapshot.symbol,
             hours=str(hours),
             headlines=headlines,
+            alt_data=alt_data_text,
             social_signals=social_signals,
         )
 
