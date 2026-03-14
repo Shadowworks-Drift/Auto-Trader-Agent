@@ -45,7 +45,10 @@ class _LLMAgent(BaseAgent):
         )
         if resp.parsed:
             return resp.parsed
-        logger.warning(f"{self.name}: could not parse JSON from LLM response for {symbol}")
+        logger.warning(
+            f"{self.name}: could not parse JSON from LLM response for {symbol} "
+            f"— raw content: {resp.content[:500]!r}"
+        )
         return {"confidence": 0.0, "reasoning": resp.content[:300]}
 
 
