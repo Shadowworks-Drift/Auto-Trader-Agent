@@ -10,6 +10,10 @@ httpx>=0.27.0             # Async HTTP for Ollama API
 openai>=1.30.0            # OpenAI-compatible client (also works with Ollama)
 tiktoken>=0.7.0           # Token counting
 
+# ── Chart Vision ───────────────────────────────────────────────────────────────
+mplfinance>=0.12.10b0     # Candlestick chart rendering for vision agent
+Pillow>=10.0.0            # PNG encode / image utilities
+
 # ── Data & Schema ─────────────────────────────────────────────────────────────
 pydantic>=2.5.0
 pydantic-settings>=2.1.0

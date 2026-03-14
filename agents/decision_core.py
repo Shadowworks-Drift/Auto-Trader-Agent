@@ -94,13 +94,15 @@ class DecisionCore:
         trigger_result: AgentResult,
         sentiment_result: AgentResult,
         regime_result: Optional[RegimeResult] = None,
+        vision_result: Optional[AgentResult] = None,
     ) -> TradeProposal:
         t0 = time.perf_counter()
 
         # ── Step 1: directional vote ───────────────────────────────────────
-        direction = self._majority_direction(
-            [quant_result, trend_result, setup_result, trigger_result, sentiment_result]
-        )
+        all_results = [quant_result, trend_result, setup_result, trigger_result, sentiment_result]
+        if vision_result is not None:
+            all_results.append(vision_result)
+        direction = self._majority_direction(all_results)
 
         if direction == "none":
             return TradeProposal(
@@ -132,6 +134,7 @@ class DecisionCore:
         score = self._fuse_scores(
             direction, quant_result, trend_result, setup_result, trigger_result, sentiment_result,
             regime=regime_result,
+            vision=vision_result,
         )
 
         # ── Step 3: compute entry / SL / TP ───────────────────────────────
@@ -155,9 +158,10 @@ class DecisionCore:
         if regime_result:
             position_size_pct *= regime_result.position_size_mult
 
-        reasoning = self._build_reasoning(
-            direction, score, quant_result, trend_result, setup_result, trigger_result, sentiment_result
-        )
+        all_for_reasoning = [quant_result, trend_result, setup_result, trigger_result, sentiment_result]
+        if vision_result is not None:
+            all_for_reasoning.append(vision_result)
+        reasoning = self._build_reasoning(direction, score, *all_for_reasoning)
 
         elapsed = (time.perf_counter() - t0) * 1000
         logger.info(
@@ -165,6 +169,16 @@ class DecisionCore:
             f"confidence={score:.2f} entry={entry:.4f} sl={sl:.4f} tp={tp:.4f} "
             f"({elapsed:.0f}ms)"
         )
+
+        agent_scores = {
+            "quant": _dir_score(direction, quant_result),
+            "trend": _dir_score(direction, trend_result),
+            "setup": _dir_score(direction, setup_result),
+            "trigger": _dir_score(direction, trigger_result),
+            "sentiment": _dir_score(direction, sentiment_result),
+        }
+        if vision_result is not None:
+            agent_scores["vision"] = _dir_score(direction, vision_result)
 
         return TradeProposal(
             symbol=snapshot.symbol,
@@ -175,13 +189,7 @@ class DecisionCore:
             take_profit=round(tp, 8),
             position_size_pct=round(position_size_pct, 4),
             regime=regime_result.regime if regime_result else "unknown",
-            agent_scores={
-                "quant": _dir_score(direction, quant_result),
-                "trend": _dir_score(direction, trend_result),
-                "setup": _dir_score(direction, setup_result),
-                "trigger": _dir_score(direction, trigger_result),
-                "sentiment": _dir_score(direction, sentiment_result),
-            },
+            agent_scores=agent_scores,
             reasoning=reasoning,
             adversarial_summary=adversarial_summary,
             sizing_method=sizing_method,
@@ -214,6 +222,7 @@ class DecisionCore:
         trigger: AgentResult,
         sentiment: AgentResult,
         regime: Optional[RegimeResult] = None,
+        vision: Optional[AgentResult] = None,
     ) -> float:
         w = self.cfg
         # Base weights
@@ -222,6 +231,8 @@ class DecisionCore:
         sw = w.setup_weight
         trgw = w.trigger_weight
         sentw = w.sentiment_weight
+        # Vision weight: only applied when the agent ran successfully
+        visw = w.vision_weight if (vision is not None and vision.success) else 0.0
 
         # Apply regime-conditional weight adjustments
         if regime and regime.weight_adjustments:
@@ -234,13 +245,15 @@ class DecisionCore:
             sentw *= adj.get("sentiment", 1.0)
 
         weighted = (
-            _dir_score(direction, quant)    * qw
-            + _dir_score(direction, trend)  * trw
-            + _dir_score(direction, setup)  * sw
-            + _dir_score(direction, trigger) * trgw
+            _dir_score(direction, quant)       * qw
+            + _dir_score(direction, trend)     * trw
+            + _dir_score(direction, setup)     * sw
+            + _dir_score(direction, trigger)   * trgw
             + _dir_score(direction, sentiment) * sentw
         )
-        total_w = qw + trw + sw + trgw + sentw
+        if visw > 0.0 and vision is not None:
+            weighted += _dir_score(direction, vision) * visw
+        total_w = qw + trw + sw + trgw + sentw + visw
         return round(weighted / max(total_w, 1e-9), 4)
 
     def _compute_levels(

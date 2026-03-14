@@ -56,6 +56,7 @@ class OllamaClient:
         base_url: str = "http://localhost:11434",
         model: str = "deepseek-r1:7b",
         fallback_model: str = "llama3:8b",
+        vision_model: str = "llava:7b",
         temperature: float = 0.1,
         max_tokens: int = 2048,
         timeout: float = 90.0,
@@ -63,6 +64,7 @@ class OllamaClient:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.fallback_model = fallback_model
+        self.vision_model = vision_model
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.timeout = timeout
@@ -135,6 +137,30 @@ class OllamaClient:
         except Exception as exc:
             logger.error(f"Failed to list models: {exc}")
             return []
+
+    async def chat_vision(
+        self,
+        image_b64: str,
+        user_msg: str,
+        system: Optional[str] = None,
+        expect_json: bool = True,
+    ) -> LLMResponse:
+        """Send a vision request with a base64-encoded image to the vision model.
+
+        Ollama multimodal API format::
+
+            {"role": "user", "content": "...", "images": ["<base64>"]}
+
+        Falls back gracefully — caller should check resp.parsed is not None.
+        """
+        messages = [{"role": "user", "content": user_msg, "images": [image_b64]}]
+        return await self._chat_request(
+            messages=messages,
+            model=self.vision_model,
+            system=system,
+            temperature=self.temperature,
+            expect_json=expect_json,
+        )
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
