@@ -39,8 +39,8 @@ class BacktestConfig:
     """Backtest configuration."""
     initial_capital: float = 10_000.0
     position_size_pct: float = 0.05       # % of equity per trade
-    stop_loss_pct: float = 0.03
-    take_profit_pct: float = 0.06
+    stop_loss_pct: float = 0.05       # 5% — wider for 4h crypto bars (ATR ~1-2%)
+    take_profit_pct: float = 0.10     # 10% — keeps 1:2 R:R vs 5% SL
     max_open_positions: int = 3
     fee_model: FeeModel = field(default_factory=FeeModel)
     slippage_model: SlippageModel = field(default_factory=SlippageModel)
@@ -335,87 +335,68 @@ class BacktestEngine:
 
 def quant_signal_fn(min_confidence: float = 0.55) -> SignalFn:
     """
-    Four-indicator voting signal: RSI momentum, MACD slope, EMA alignment,
-    Bollinger Band position.  Requires 3-of-4 agreement (conf >= 0.75) to
-    generate a tradeable signal, reducing noise vs the old 3-indicator version.
+    Regime-aware trend-following strategy using a 4-factor EMA stack.
+
+    Factors (each ±1):
+      F1  EMA9  vs EMA21  — short-term trend direction
+      F2  EMA21 vs EMA50  — medium-term trend direction
+      F3  EMA50 10-bar slope > ±0.3% — trend has momentum
+      F4  MACD line vs signal line — momentum confirmation
+
+    RSI(14) acts as an exclusion filter: no longs when RSI > 75 (overbought),
+    no shorts when RSI < 25 (oversold).
+
+    Entry: 3 or 4 factors aligned → confidence = count/4 (0.75 or 1.0).
+    This correctly switches from short→long as the EMA stack flips, capturing
+    both the April 2024 BTC correction (bearish stack) and May recovery (bullish).
     """
     def _fn(df: pd.DataFrame) -> Dict[str, Any]:
-        if len(df) < 50:
+        if len(df) < 60:
             return {"direction": "none", "confidence": 0.0}
 
         close = df["close"]
+        n     = len(close)
 
-        # ── RSI(14) ────────────────────────────────────────────────────────
+        # ── EMA stack ─────────────────────────────────────────────────────
+        ema9  = close.ewm(span=9,  adjust=False).mean()
+        ema21 = close.ewm(span=21, adjust=False).mean()
+        ema50 = close.ewm(span=50, adjust=False).mean()
+
+        e9  = float(ema9.iloc[-1])
+        e21 = float(ema21.iloc[-1])
+        e50 = float(ema50.iloc[-1])
+
+        # ── EMA50 10-bar slope ─────────────────────────────────────────────
+        lookback    = min(10, n - 1)
+        e50_past    = float(ema50.iloc[-1 - lookback])
+        slope       = (e50 - e50_past) / e50_past if e50_past != 0 else 0.0
+
+        # ── MACD(12,26,9) ─────────────────────────────────────────────────
+        macd_line   = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
+        signal_line = macd_line.ewm(span=9, adjust=False).mean()
+        macd_bull   = float(macd_line.iloc[-1]) > float(signal_line.iloc[-1])
+
+        # ── RSI(14) exclusion filter ───────────────────────────────────────
         delta = close.diff()
-        gain  = delta.clip(lower=0).rolling(14).mean()
-        loss  = (-delta.clip(upper=0)).rolling(14).mean()
+        gain  = delta.clip(lower=0).rolling(14, min_periods=1).mean()
+        loss  = (-delta.clip(upper=0)).rolling(14, min_periods=1).mean()
         rsi   = 100 - 100 / (1 + gain / loss.replace(0, np.nan))
-        rsi_v    = float(rsi.iloc[-1])  if not pd.isna(rsi.iloc[-1])    else 50.0
-        rsi_prev = float(rsi.iloc[-2])  if len(rsi) > 1 and not pd.isna(rsi.iloc[-2]) else rsi_v
+        rsi_v = float(rsi.iloc[-1]) if not pd.isna(rsi.iloc[-1]) else 50.0
 
-        # ── MACD(12,26,9) histogram slope ─────────────────────────────────
-        macd_line = close.ewm(span=12).mean() - close.ewm(span=26).mean()
-        hist      = macd_line - macd_line.ewm(span=9).mean()
-        hist_v    = float(hist.iloc[-1])
-        hist_prev = float(hist.iloc[-2]) if len(hist) > 1 else 0.0
+        # ── Factor scores ─────────────────────────────────────────────────
+        f1 = 1 if e9  > e21 else -1                         # EMA9  vs EMA21
+        f2 = 1 if e21 > e50 else -1                         # EMA21 vs EMA50
+        f3 = 1 if slope > 0.003 else (-1 if slope < -0.003 else 0)  # slope
+        f4 = 1 if macd_bull else -1                         # MACD
 
-        # ── EMA alignment ─────────────────────────────────────────────────
-        ema20 = float(close.ewm(span=20).mean().iloc[-1])
-        ema50 = float(close.ewm(span=50).mean().iloc[-1])
-        price = float(close.iloc[-1])
+        bull = sum(1 for f in [f1, f2, f3, f4] if f > 0)
+        bear = sum(1 for f in [f1, f2, f3, f4] if f < 0)
 
-        # ── Bollinger Bands(20, 2σ) ────────────────────────────────────────
-        bb_mid   = float(close.rolling(20).mean().iloc[-1])
-        bb_std   = float(close.rolling(20).std().iloc[-1])
-        bb_upper = bb_mid + 2 * bb_std
-        bb_lower = bb_mid - 2 * bb_std
-
-        votes = []
-
-        # 1. RSI: favour direction of momentum (not just extreme levels)
-        if rsi_v < 45 and rsi_v > rsi_prev:      # recovering from weakness → long
-            votes.append(1)
-        elif rsi_v > 55 and rsi_v < rsi_prev:    # fading from strength → short
-            votes.append(-1)
-        elif rsi_v <= 35:                         # deeply oversold
-            votes.append(1)
-        elif rsi_v >= 65:                         # deeply overbought
-            votes.append(-1)
-        else:
-            votes.append(0)
-
-        # 2. MACD histogram slope (direction AND acceleration)
-        if hist_v > 0 and hist_v >= hist_prev:
-            votes.append(1)
-        elif hist_v < 0 and hist_v <= hist_prev:
-            votes.append(-1)
-        else:
-            votes.append(0)
-
-        # 3. EMA trend alignment
-        if price > ema20 > ema50:
-            votes.append(1)
-        elif price < ema20 < ema50:
-            votes.append(-1)
-        else:
-            votes.append(0)
-
-        # 4. Bollinger Band position
-        if price < bb_lower:
-            votes.append(1)    # below lower band: mean-reversion long
-        elif price > bb_upper:
-            votes.append(-1)   # above upper band: mean-reversion short
-        elif price > bb_mid and ema20 > ema50:
-            votes.append(1)    # above midband in uptrend: continuation
-        elif price < bb_mid and ema20 < ema50:
-            votes.append(-1)   # below midband in downtrend: continuation
-        else:
-            votes.append(0)
-
-        score     = sum(votes) / len(votes)          # ∈ {-1, -0.75, …, 0.75, 1}
-        conf      = abs(score)
-        direction = "long" if score > 0.4 else "short" if score < -0.4 else "none"
-        return {"direction": direction, "confidence": conf}
+        if bull >= 3 and rsi_v < 75:
+            return {"direction": "long",  "confidence": bull / 4.0}
+        if bear >= 3 and rsi_v > 25:
+            return {"direction": "short", "confidence": bear / 4.0}
+        return {"direction": "none", "confidence": 0.0}
 
     return _fn
 
