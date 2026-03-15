@@ -38,15 +38,15 @@ from .slippage_model import FeeModel, SlippageModel
 class BacktestConfig:
     """Backtest configuration."""
     initial_capital: float = 10_000.0
-    position_size_pct: float = 0.05       # % of equity per trade
-    stop_loss_pct: float = 0.05       # 5% — wider for 4h crypto bars (ATR ~1-2%)
-    take_profit_pct: float = 0.10     # 10% — keeps 1:2 R:R vs 5% SL
+    position_size_pct: float = 0.15       # 15% — large enough for meaningful equity moves
+    stop_loss_pct: float = 0.05           # 5% — wider for 4h crypto bars (ATR ~1-2%)
+    take_profit_pct: float = 0.10         # 10% — keeps 1:2 R:R vs 5% SL
     max_open_positions: int = 3
     fee_model: FeeModel = field(default_factory=FeeModel)
     slippage_model: SlippageModel = field(default_factory=SlippageModel)
     commission_in_cost: bool = True
     # Walk-forward settings
-    train_window_bars: int = 600          # ~100 days on 4h
+    train_window_bars: int = 200          # ~33 days on 4h — enough to warm indicators
     test_window_bars: int = 150           # ~25 days on 4h
     walk_forward: bool = True
 
@@ -335,72 +335,88 @@ class BacktestEngine:
 
 def quant_signal_fn(min_confidence: float = 0.55) -> SignalFn:
     """
-    EMA crossover trigger with trend + momentum confirmation.
+    ADX + Directional Index (DI) trend-following signal.
 
-    Fires ONLY on EMA9/EMA21 crossover bars (event-based, not state-based).
-    This prevents the rapid re-entry churn that occurs when alignment-based
-    signals fire every bar in choppy markets.
+    The ADX system directly measures trend STRENGTH and DIRECTION without
+    relying on lagging EMA stack alignment — so it detects a new downtrend
+    even before EMA21 crosses below EMA50.
 
-    Confirmation (need ≥ 2 of 3):
-      C1  EMA21 aligned with crossover direction vs EMA50 (trend filter)
-      C2  EMA50 10-bar slope positive/negative (trend has momentum)
-      C3  MACD line vs signal line (momentum agreement)
+    Signal rules:
+      - +DI crosses above -DI AND ADX >= 20  →  LONG  (bull trend establishing)
+      - -DI crosses above +DI AND ADX >= 20  →  SHORT (bear trend establishing)
+      - ADX crosses above 25 while DI already diverged → late entry allowed
+      - RSI(14) exclusion: no longs >75, no shorts <25
 
-    RSI(14) is an exclusion-only filter (no overbought longs / oversold shorts).
+    Confidence scaled by ADX strength (20→0.65, 30→0.75, 50→0.90).
     """
     def _fn(df: pd.DataFrame) -> Dict[str, Any]:
-        if len(df) < 60:
+        if len(df) < 30:
+            return {"direction": "none", "confidence": 0.0}
+        if "high" not in df.columns or "low" not in df.columns:
             return {"direction": "none", "confidence": 0.0}
 
         close = df["close"]
-        n     = len(close)
+        high  = df["high"]
+        low   = df["low"]
+        period = 14
 
-        # ── EMA stack ─────────────────────────────────────────────────────
-        ema9  = close.ewm(span=9,  adjust=False).mean()
-        ema21 = close.ewm(span=21, adjust=False).mean()
-        ema50 = close.ewm(span=50, adjust=False).mean()
+        # ── True Range ────────────────────────────────────────────────────
+        prev_close = close.shift(1)
+        tr = pd.concat([
+            high - low,
+            (high - prev_close).abs(),
+            (low  - prev_close).abs(),
+        ], axis=1).max(axis=1)
 
-        e9      = float(ema9.iloc[-1]);  e9_prev  = float(ema9.iloc[-2])
-        e21     = float(ema21.iloc[-1]); e21_prev = float(ema21.iloc[-2])
-        e50     = float(ema50.iloc[-1])
+        # ── Directional movement ──────────────────────────────────────────
+        up   = high.diff()
+        down = -low.diff()
+        plus_dm  = pd.Series(np.where((up > down) & (up > 0),   up,   0.0), index=close.index)
+        minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=close.index)
 
-        # ── Only act on crossover bars ─────────────────────────────────────
-        cross_up = e9 > e21 and e9_prev <= e21_prev   # EMA9 just crossed above EMA21
-        cross_dn = e9 < e21 and e9_prev >= e21_prev   # EMA9 just crossed below EMA21
-        if not cross_up and not cross_dn:
+        # Wilder smoothing (alpha = 1/period)
+        a = 1.0 / period
+        atr14     = tr.ewm(alpha=a, adjust=False).mean()
+        plus_di   = 100 * plus_dm.ewm(alpha=a,  adjust=False).mean() / atr14.replace(0, np.nan)
+        minus_di  = 100 * minus_dm.ewm(alpha=a, adjust=False).mean() / atr14.replace(0, np.nan)
+        dx        = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+        adx       = dx.ewm(alpha=a, adjust=False).mean()
+
+        def _safe(s: pd.Series, default=0.0) -> float:
+            v = s.iloc[-1]
+            return float(v) if not pd.isna(v) else default
+
+        def _safe2(s: pd.Series, default=0.0) -> float:
+            v = s.iloc[-2] if len(s) > 1 else s.iloc[-1]
+            return float(v) if not pd.isna(v) else default
+
+        adx_v  = _safe(adx);       adx_prev  = _safe2(adx)
+        pdi_v  = _safe(plus_di);   pdi_prev  = _safe2(plus_di)
+        mdi_v  = _safe(minus_di);  mdi_prev  = _safe2(minus_di)
+
+        # ── RSI(14) exclusion filter ──────────────────────────────────────
+        delta = close.diff()
+        gain  = delta.clip(lower=0).rolling(period, min_periods=1).mean()
+        loss  = (-delta.clip(upper=0)).rolling(period, min_periods=1).mean()
+        rsi_v = _safe(100 - 100 / (1 + gain / loss.replace(0, np.nan)), 50.0)
+
+        if adx_v < 20:
             return {"direction": "none", "confidence": 0.0}
 
-        # ── Confirmation factors ───────────────────────────────────────────
-        lookback = min(10, n - 1)
-        e50_past = float(ema50.iloc[-1 - lookback])
-        slope    = (e50 - e50_past) / e50_past if e50_past != 0 else 0.0
+        conf = min(0.50 + adx_v / 100.0, 0.95)   # 20→0.70, 30→0.80, 50→0.95
 
-        macd_line   = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
-        signal_line = macd_line.ewm(span=9, adjust=False).mean()
-        macd_bull   = float(macd_line.iloc[-1]) > float(signal_line.iloc[-1])
+        # DI crossover (event) OR ADX just broke threshold while DI diverged
+        di_cross_up  = pdi_v > mdi_v and pdi_prev <= mdi_prev
+        di_cross_dn  = mdi_v > pdi_v and mdi_prev <= pdi_prev
+        adx_breakout = adx_v >= 25 and adx_prev < 25
 
-        delta = close.diff()
-        gain  = delta.clip(lower=0).rolling(14, min_periods=1).mean()
-        loss  = (-delta.clip(upper=0)).rolling(14, min_periods=1).mean()
-        rsi   = 100 - 100 / (1 + gain / loss.replace(0, np.nan))
-        rsi_v = float(rsi.iloc[-1]) if not pd.isna(rsi.iloc[-1]) else 50.0
+        long_signal  = (di_cross_up  or (adx_breakout and pdi_v > mdi_v)) and rsi_v < 75
+        short_signal = (di_cross_dn  or (adx_breakout and mdi_v > pdi_v)) and rsi_v > 25
 
-        if cross_up:
-            c1 = e21 > e50             # medium trend bullish
-            c2 = slope > 0.001         # EMA50 rising
-            c3 = macd_bull             # MACD confirms
-            confirms = sum([c1, c2, c3])
-            if confirms >= 2 and rsi_v < 75:
-                return {"direction": "long",  "confidence": 0.75 + 0.08 * (confirms - 2)}
-
-        if cross_dn:
-            c1 = e21 < e50             # medium trend bearish
-            c2 = slope < -0.001        # EMA50 falling
-            c3 = not macd_bull         # MACD confirms
-            confirms = sum([c1, c2, c3])
-            if confirms >= 2 and rsi_v > 25:
-                return {"direction": "short", "confidence": 0.75 + 0.08 * (confirms - 2)}
-
+        if long_signal:
+            return {"direction": "long",  "confidence": conf}
+        if short_signal:
+            return {"direction": "short", "confidence": conf}
         return {"direction": "none", "confidence": 0.0}
 
     return _fn
