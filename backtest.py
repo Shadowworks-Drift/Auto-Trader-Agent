@@ -8,6 +8,12 @@ Usage::
     # Backtest quant-only signal on BTC (fetches data from exchange)
     python backtest.py --symbol BTC/USDT --from 2024-01-01 --to 2024-12-31
 
+    # Choose a different resolution
+    python backtest.py --symbol BTC/USDT --timeframe 1h --from 2022-01-01
+
+    # Fetch all available history on 1d bars
+    python backtest.py --symbol BTC/USDT --timeframe 1d --all-history
+
     # Backtest from a local CSV
     python backtest.py --symbol BTC/USDT --csv data/btc_4h.csv
 
@@ -16,6 +22,11 @@ Usage::
 
     # Save results to JSON
     python backtest.py --symbol BTC/USDT --save results/btc_backtest.json
+
+Available timeframes (Binance):
+    1m  3m  5m  15m  30m
+    1h  2h  4h  6h  8h  12h
+    1d  3d  1w  1M
 """
 
 from __future__ import annotations
@@ -23,11 +34,83 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+
+# ── Timeframe helpers ─────────────────────────────────────────────────────────
+
+TIMEFRAME_MINUTES: dict[str, float] = {
+    "1m":  1,    "3m":   3,   "5m":   5,   "15m":  15,   "30m":  30,
+    "1h":  60,   "2h":   120, "4h":   240,  "6h":   360,  "8h":   480,
+    "12h": 720,  "1d":   1440,"3d":   4320, "1w":   10080,"1M":   43200,
+}
+
+
+def bars_per_day(timeframe: str) -> float:
+    """Return the number of bars in one calendar day for the given timeframe."""
+    return 1440.0 / TIMEFRAME_MINUTES.get(timeframe, 240)
+
+
+def days_to_bars(days: float, timeframe: str) -> int:
+    """Convert a number of calendar days to an approximate bar count."""
+    return max(1, int(days * bars_per_day(timeframe)))
+
+
+# ── Paginated historical fetch ─────────────────────────────────────────────────
+
+async def fetch_full_history(
+    exchange,
+    symbol: str,
+    timeframe: str,
+    since_ms: int,
+    until_ms: int,
+    console=None,
+) -> list:
+    """
+    Paginate CCXT fetch_ohlcv to retrieve every bar between since_ms and until_ms.
+
+    Binance caps each request at 1 000 bars.  We advance the 'since' cursor by
+    one bar width after each page until we reach until_ms or the exchange stops
+    returning data.
+    """
+    tf_ms = int(TIMEFRAME_MINUTES.get(timeframe, 240) * 60 * 1000)
+    all_bars: list = []
+    cursor = since_ms
+    page = 0
+
+    while cursor < until_ms:
+        chunk = await exchange.fetch_ohlcv(
+            symbol, timeframe=timeframe, since=cursor, limit=1000
+        )
+        if not chunk:
+            break
+
+        # Filter out bars beyond until_ms
+        chunk = [b for b in chunk if b[0] <= until_ms]
+        all_bars.extend(chunk)
+        page += 1
+
+        last_ts = chunk[-1][0]
+        if console and page % 5 == 0:
+            loaded_dt = datetime.fromtimestamp(last_ts / 1000, tz=timezone.utc)
+            console.print(
+                f"  [dim]...fetching page {page}, up to {loaded_dt:%Y-%m-%d}[/dim]"
+            )
+
+        if last_ts >= until_ms or len(chunk) < 1000:
+            break
+
+        # Advance cursor to the bar right after the last one received
+        cursor = last_ts + tf_ms
+        await asyncio.sleep(0.25)   # stay well within rate limits
+
+    return all_bars
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 async def async_main(args: argparse.Namespace) -> None:
     from config.settings import Settings
@@ -39,6 +122,10 @@ async def async_main(args: argparse.Namespace) -> None:
     console = Console()
     settings = Settings.from_yaml(Path(args.config))
 
+    # ── Walk-forward window sizing scaled to chosen timeframe ─────────────────
+    train_bars = days_to_bars(args.train_days, args.timeframe)
+    test_bars  = days_to_bars(args.test_days,  args.timeframe)
+
     cfg = BacktestConfig(
         initial_capital=float(args.capital),
         position_size_pct=settings.trading.position_size_pct,
@@ -48,29 +135,71 @@ async def async_main(args: argparse.Namespace) -> None:
         fee_model=FeeModel.for_exchange(settings.exchange.id),
         slippage_model=SlippageModel.for_asset(args.symbol),
         walk_forward=args.walk_forward,
+        train_window_bars=train_bars,
+        test_window_bars=test_bars,
     )
 
     if args.csv:
         engine = BacktestEngine.from_csv(args.symbol, args.csv, quant_signal_fn(), cfg)
     else:
-        # Fetch data from exchange
         import ccxt.async_support as ccxt
-        console.print(f"Fetching {args.symbol} data from {settings.exchange.id}...")
+        import pandas as pd
+
+        console.print(
+            f"Fetching [bold]{args.symbol}[/bold] data from {settings.exchange.id} "
+            f"[dim]({args.timeframe} bars)[/dim]..."
+        )
         exchange_class = getattr(ccxt, settings.exchange.id)
         exchange = exchange_class({"enableRateLimit": True})
+
         try:
-            since = int(datetime.fromisoformat(args.from_date).timestamp() * 1000) if args.from_date else None
-            raw = await exchange.fetch_ohlcv(args.symbol, timeframe="4h", since=since, limit=2000)
+            if args.all_history:
+                # Start from exchange's minimum supported timestamp (usually ~2017 for Binance)
+                since_ms = int(datetime(2017, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+            elif args.from_date:
+                since_ms = int(
+                    datetime.fromisoformat(args.from_date)
+                    .replace(tzinfo=timezone.utc)
+                    .timestamp() * 1000
+                )
+            else:
+                since_ms = int(datetime(2024, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+
+            until_ms = (
+                int(
+                    datetime.fromisoformat(args.to_date)
+                    .replace(tzinfo=timezone.utc)
+                    .timestamp() * 1000
+                )
+                if args.to_date
+                else int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+            )
+
+            raw = await fetch_full_history(
+                exchange, args.symbol, args.timeframe,
+                since_ms, until_ms, console=console,
+            )
         finally:
             await exchange.close()
 
-        import pandas as pd
-        df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-        if args.to_date:
-            df = df[df["timestamp"] <= args.to_date]
+        if not raw:
+            console.print("[red]No data returned. Check symbol / timeframe / date range.[/red]")
+            return
 
-        console.print(f"  Loaded {len(df)} bars from {df['timestamp'].iloc[0]:%Y-%m-%d} to {df['timestamp'].iloc[-1]:%Y-%m-%d}")
+        df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True).dt.tz_localize(None)
+        df = df.drop_duplicates("timestamp").sort_values("timestamp").reset_index(drop=True)
+
+        console.print(
+            f"  Loaded [bold]{len(df):,}[/bold] bars  "
+            f"[dim]{df['timestamp'].iloc[0]:%Y-%m-%d} → {df['timestamp'].iloc[-1]:%Y-%m-%d}[/dim]"
+        )
+        console.print(
+            f"  Walk-forward: [bold]{train_bars}[/bold] train bars / "
+            f"[bold]{test_bars}[/bold] test bars  "
+            f"[dim](~{args.train_days:.0f}d / ~{args.test_days:.0f}d)[/dim]"
+        )
+
         engine = BacktestEngine(args.symbol, df, quant_signal_fn(), cfg)
 
     console.print(f"\nRunning backtest{'  (walk-forward)' if args.walk_forward else ''}...")
@@ -85,15 +214,34 @@ async def async_main(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Auto-Trader-Agent Backtester")
-    parser.add_argument("--symbol", default="BTC/USDT")
-    parser.add_argument("--config", default="config/config.yaml")
-    parser.add_argument("--csv", help="Path to local OHLCV CSV file")
-    parser.add_argument("--from", dest="from_date", default="2024-01-01")
-    parser.add_argument("--to",   dest="to_date",   default=None)
-    parser.add_argument("--capital", default=10000, type=float)
-    parser.add_argument("--walk-forward", action="store_true", default=True)
-    parser.add_argument("--save", help="Save JSON results to this path")
+    parser = argparse.ArgumentParser(
+        description="Auto-Trader-Agent Backtester",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument("--symbol",    default="BTC/USDT",
+                        help="Trading pair, e.g. BTC/USDT (default: BTC/USDT)")
+    parser.add_argument("--timeframe", default="4h",
+                        choices=list(TIMEFRAME_MINUTES),
+                        metavar="TF",
+                        help=f"Bar resolution. Options: {', '.join(TIMEFRAME_MINUTES)}  (default: 4h)")
+    parser.add_argument("--config",    default="config/config.yaml")
+    parser.add_argument("--csv",       help="Path to local OHLCV CSV file")
+    parser.add_argument("--from",      dest="from_date", default=None,
+                        help="Start date ISO-8601, e.g. 2022-01-01 (default: 2024-01-01)")
+    parser.add_argument("--to",        dest="to_date",   default=None,
+                        help="End date ISO-8601 (default: today)")
+    parser.add_argument("--all-history", action="store_true", default=False,
+                        help="Fetch all available history from the exchange (from 2017-01-01)")
+    parser.add_argument("--capital",   default=10_000, type=float,
+                        help="Starting capital in USD (default: 10000)")
+    parser.add_argument("--walk-forward", action="store_true", default=True,
+                        help="Enable walk-forward validation (default: on)")
+    parser.add_argument("--train-days", dest="train_days", type=float, default=90,
+                        help="Training window in calendar days (default: 90)")
+    parser.add_argument("--test-days",  dest="test_days",  type=float, default=30,
+                        help="Test window in calendar days (default: 30)")
+    parser.add_argument("--save",      help="Save JSON results to this path")
     args = parser.parse_args()
     asyncio.run(async_main(args))
 
