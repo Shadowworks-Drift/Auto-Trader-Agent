@@ -80,8 +80,8 @@ class SlippageModel:
         spread_cost = self.spread_pct
 
         # 2. Market impact (Almgren-Chriss sqrt law)
-        participation = order_value / max(avg_daily_volume_usd * 0.20, order_value)
-        impact = self.impact_coeff * (participation ** 0.5)
+        participation = order_value / max(avg_daily_volume_usd * 0.20, abs(order_value))
+        impact = self.impact_coeff * (max(0.0, participation) ** 0.5)
 
         # 3. Vol scaling
         vol_mult = (atr_pct / 0.02) if self.vol_scaling else 1.0
