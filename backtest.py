@@ -133,11 +133,14 @@ async def async_main(args: argparse.Namespace) -> None:
     train_bars = days_to_bars(args.train_days, args.timeframe)
     test_bars  = days_to_bars(args.test_days,  args.timeframe)
 
+    sl_pct = args.sl_pct if args.sl_pct is not None else settings.risk.stop_loss_pct
+    tp_pct = args.tp_pct if args.tp_pct is not None else settings.risk.take_profit_pct
+
     cfg = BacktestConfig(
         initial_capital=float(args.capital),
         position_size_pct=settings.trading.position_size_pct,
-        stop_loss_pct=settings.risk.stop_loss_pct,
-        take_profit_pct=settings.risk.take_profit_pct,
+        stop_loss_pct=sl_pct,
+        take_profit_pct=tp_pct,
         max_open_positions=settings.trading.max_open_positions,
         fee_model=FeeModel.for_exchange(settings.exchange.id),
         slippage_model=SlippageModel.for_asset(args.symbol),
@@ -147,6 +150,9 @@ async def async_main(args: argparse.Namespace) -> None:
         use_atr_stops=args.atr_stops,
         atr_sl_mult=args.atr_sl_mult,
         atr_tp_mult=args.atr_tp_mult,
+        trailing_stop=args.trailing_stop,
+        trailing_stop_pct=args.trailing_stop_pct,
+        cooldown_bars_after_sl=args.cooldown,
     )
 
     if args.csv:
@@ -204,14 +210,16 @@ async def async_main(args: argparse.Namespace) -> None:
             f"  Loaded [bold]{len(df):,}[/bold] bars  "
             f"[dim]{df['timestamp'].iloc[0]:%Y-%m-%d} → {df['timestamp'].iloc[-1]:%Y-%m-%d}[/dim]"
         )
-        stops_label = (
-            f"ATR×{args.atr_sl_mult:.1f}/×{args.atr_tp_mult:.1f}"
-            if args.atr_stops else
-            f"fixed {settings.risk.stop_loss_pct*100:.0f}%/{settings.risk.take_profit_pct*100:.0f}%"
-        )
+        if args.atr_stops:
+            stops_label = f"ATR×{args.atr_sl_mult:.1f} SL / ×{args.atr_tp_mult:.1f} TP"
+        else:
+            stops_label = f"fixed {sl_pct*100:.0f}% SL / {tp_pct*100:.0f}% TP"
+        if args.trailing_stop:
+            stops_label += f" + trail {args.trailing_stop_pct*100:.0f}%"
+        cooldown_label = f"  |  cooldown {args.cooldown}b after SL" if args.cooldown > 0 else ""
         console.print(
             f"  Signal: [bold]{signal_label}[/bold]  |  "
-            f"Stops: [bold]{stops_label}[/bold]  |  "
+            f"Stops: [bold]{stops_label}[/bold]{cooldown_label}  |  "
             f"WF: [bold]{train_bars}[/bold] train / [bold]{test_bars}[/bold] test bars"
         )
 
@@ -262,6 +270,12 @@ def main() -> None:
                         help="Signal function: 'multi' = multi-factor confluence (default), "
                              "'quant' = ADX/DI crossover (original)")
 
+    # Fixed SL/TP overrides (override config values without editing yaml)
+    parser.add_argument("--sl", dest="sl_pct", type=float, default=None,
+                        help="Fixed stop loss %% (e.g. 0.05 = 5%%). Overrides config. Default: from config.")
+    parser.add_argument("--tp", dest="tp_pct", type=float, default=None,
+                        help="Fixed take profit %% (e.g. 0.15 = 15%%). Overrides config. Default: from config.")
+
     # ATR-based adaptive stops
     parser.add_argument("--atr-stops", action="store_true", default=False,
                         help="Use ATR-based adaptive stop loss / take profit instead of fixed %%")
@@ -269,6 +283,16 @@ def main() -> None:
                         help="ATR multiplier for stop loss (default: 2.0 → SL = 2×ATR from entry)")
     parser.add_argument("--atr-tp-mult", dest="atr_tp_mult", type=float, default=4.0,
                         help="ATR multiplier for take profit (default: 4.0 → 1:2 R:R with 2.0 SL mult)")
+
+    # Trailing stop
+    parser.add_argument("--trailing-stop", action="store_true", default=False,
+                        help="Trail stop loss as trade moves in your favour (lets winners run)")
+    parser.add_argument("--trailing-stop-pct", dest="trailing_stop_pct", type=float, default=0.03,
+                        help="How far below high-watermark to trail the stop (default: 0.03 = 3%%)")
+
+    # Cooldown after stop-loss
+    parser.add_argument("--cooldown", dest="cooldown", type=int, default=10,
+                        help="Bars to wait before re-entering same direction after a stop-loss (default: 10)")
 
     parser.add_argument("--save",      help="Save JSON results to this path")
     args = parser.parse_args()
