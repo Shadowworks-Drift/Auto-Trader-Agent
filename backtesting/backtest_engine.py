@@ -253,6 +253,7 @@ class BacktestEngine:
                 equity_history.append((bar_time, capital))
                 continue
 
+
             try:
                 if asyncio.iscoroutinefunction(self.signal_fn):
                     signal = await self.signal_fn(lookback_df)
@@ -297,7 +298,15 @@ class BacktestEngine:
                 capital -= fee_cost
                 next_pos_id += 1
 
-            equity_history.append((bar_time, capital))
+            # Mark-to-market: include unrealised P&L of open positions
+            unrealised = 0.0
+            for pos in open_positions.values():
+                units = pos["entry_value"] / pos["entry_price"]
+                if pos["direction"] == "long":
+                    unrealised += (close - pos["entry_price"]) * units
+                else:
+                    unrealised += (pos["entry_price"] - close) * units
+            equity_history.append((bar_time, capital + unrealised))
 
         # ── Close any remaining positions at end of data ───────────────────
         if open_positions:
@@ -326,39 +335,86 @@ class BacktestEngine:
 
 def quant_signal_fn(min_confidence: float = 0.55) -> SignalFn:
     """
-    Returns a signal function using the same QuantAnalyst logic
-    but synchronously on a DataFrame slice.
+    Four-indicator voting signal: RSI momentum, MACD slope, EMA alignment,
+    Bollinger Band position.  Requires 3-of-4 agreement (conf >= 0.75) to
+    generate a tradeable signal, reducing noise vs the old 3-indicator version.
     """
     def _fn(df: pd.DataFrame) -> Dict[str, Any]:
+        if len(df) < 50:
+            return {"direction": "none", "confidence": 0.0}
+
         close = df["close"]
-        # RSI
+
+        # ── RSI(14) ────────────────────────────────────────────────────────
         delta = close.diff()
-        gain = delta.clip(lower=0).rolling(14).mean()
-        loss = (-delta.clip(upper=0)).rolling(14).mean()
-        rsi = 100 - 100 / (1 + gain / loss.replace(0, np.nan))
-        rsi_v = float(rsi.iloc[-1]) if not rsi.empty else 50
+        gain  = delta.clip(lower=0).rolling(14).mean()
+        loss  = (-delta.clip(upper=0)).rolling(14).mean()
+        rsi   = 100 - 100 / (1 + gain / loss.replace(0, np.nan))
+        rsi_v    = float(rsi.iloc[-1])  if not pd.isna(rsi.iloc[-1])    else 50.0
+        rsi_prev = float(rsi.iloc[-2])  if len(rsi) > 1 and not pd.isna(rsi.iloc[-2]) else rsi_v
 
-        # MACD
-        ema12 = close.ewm(span=12).mean()
-        ema26 = close.ewm(span=26).mean()
-        macd = ema12 - ema26
-        sig  = macd.ewm(span=9).mean()
-        hist = float((macd - sig).iloc[-1])
+        # ── MACD(12,26,9) histogram slope ─────────────────────────────────
+        macd_line = close.ewm(span=12).mean() - close.ewm(span=26).mean()
+        hist      = macd_line - macd_line.ewm(span=9).mean()
+        hist_v    = float(hist.iloc[-1])
+        hist_prev = float(hist.iloc[-2]) if len(hist) > 1 else 0.0
 
-        # EMA trend
-        ema20  = float(close.ewm(span=20).mean().iloc[-1])
-        ema50  = float(close.ewm(span=50).mean().iloc[-1])
-        price  = float(close.iloc[-1])
+        # ── EMA alignment ─────────────────────────────────────────────────
+        ema20 = float(close.ewm(span=20).mean().iloc[-1])
+        ema50 = float(close.ewm(span=50).mean().iloc[-1])
+        price = float(close.iloc[-1])
 
-        # Vote
+        # ── Bollinger Bands(20, 2σ) ────────────────────────────────────────
+        bb_mid   = float(close.rolling(20).mean().iloc[-1])
+        bb_std   = float(close.rolling(20).std().iloc[-1])
+        bb_upper = bb_mid + 2 * bb_std
+        bb_lower = bb_mid - 2 * bb_std
+
         votes = []
-        votes.append(1 if rsi_v < 35 else (-1 if rsi_v > 65 else 0))
-        votes.append(1 if hist > 0 else -1)
-        votes.append(1 if price > ema20 > ema50 else (-1 if price < ema20 < ema50 else 0))
 
-        score = sum(votes) / len(votes)
-        conf  = abs(score)
-        direction = "long" if score > 0.2 else "short" if score < -0.2 else "none"
+        # 1. RSI: favour direction of momentum (not just extreme levels)
+        if rsi_v < 45 and rsi_v > rsi_prev:      # recovering from weakness → long
+            votes.append(1)
+        elif rsi_v > 55 and rsi_v < rsi_prev:    # fading from strength → short
+            votes.append(-1)
+        elif rsi_v <= 35:                         # deeply oversold
+            votes.append(1)
+        elif rsi_v >= 65:                         # deeply overbought
+            votes.append(-1)
+        else:
+            votes.append(0)
+
+        # 2. MACD histogram slope (direction AND acceleration)
+        if hist_v > 0 and hist_v >= hist_prev:
+            votes.append(1)
+        elif hist_v < 0 and hist_v <= hist_prev:
+            votes.append(-1)
+        else:
+            votes.append(0)
+
+        # 3. EMA trend alignment
+        if price > ema20 > ema50:
+            votes.append(1)
+        elif price < ema20 < ema50:
+            votes.append(-1)
+        else:
+            votes.append(0)
+
+        # 4. Bollinger Band position
+        if price < bb_lower:
+            votes.append(1)    # below lower band: mean-reversion long
+        elif price > bb_upper:
+            votes.append(-1)   # above upper band: mean-reversion short
+        elif price > bb_mid and ema20 > ema50:
+            votes.append(1)    # above midband in uptrend: continuation
+        elif price < bb_mid and ema20 < ema50:
+            votes.append(-1)   # below midband in downtrend: continuation
+        else:
+            votes.append(0)
+
+        score     = sum(votes) / len(votes)          # ∈ {-1, -0.75, …, 0.75, 1}
+        conf      = abs(score)
+        direction = "long" if score > 0.4 else "short" if score < -0.4 else "none"
         return {"direction": direction, "confidence": conf}
 
     return _fn
