@@ -54,6 +54,11 @@ class BacktestConfig:
     atr_period: int = 14
     atr_sl_mult: float = 2.0             # stop = entry ± atr_sl_mult × ATR
     atr_tp_mult: float = 4.0             # target = entry ± atr_tp_mult × ATR (1:2 R:R)
+    # Trailing stop — activates once price moves in our favour
+    trailing_stop: bool = False
+    trailing_stop_pct: float = 0.03      # trail SL this far below the high-watermark (3%)
+    # Cooldown — bars to skip re-entry in same direction after a stop-loss
+    cooldown_bars_after_sl: int = 0      # 0 = disabled
 
 
 # ── Trade record ──────────────────────────────────────────────────────────────
@@ -234,6 +239,8 @@ class BacktestEngine:
         # Open positions: {pos_id: {...}}
         open_positions: Dict[int, Dict[str, Any]] = {}
         next_pos_id = 0
+        # Cooldown: bar index of the last stop-loss exit, per direction
+        last_sl_bar: Dict[str, int] = {"long": -9999, "short": -9999}
 
         for bar_idx in range(start_bar, end_bar):
             bar = self.df.iloc[bar_idx]
@@ -242,7 +249,7 @@ class BacktestEngine:
             high  = float(bar["high"])
             low   = float(bar["low"])
 
-            # ── Check SL/TP on open positions ─────────────────────────────
+            # ── Check SL/TP, update trailing stops ────────────────────────
             for pos_id in list(open_positions.keys()):
                 pos = open_positions[pos_id]
                 closed, exit_price, reason = _check_sl_tp(pos, high, low, close)
@@ -250,14 +257,31 @@ class BacktestEngine:
                     trade = _close_position(pos, exit_price, bar_idx, bar_time, reason, capital, self._fees, self._slippage)
                     capital += trade.pnl_after_costs
                     trades.append(trade)
+                    if reason == "stop_loss":
+                        last_sl_bar[pos["direction"]] = bar_idx
                     del open_positions[pos_id]
+                elif self.cfg.trailing_stop:
+                    # Ratchet the stop toward price as it moves in our favour
+                    if pos["direction"] == "long":
+                        wm = pos.get("watermark", pos["entry_price"])
+                        if close > wm:
+                            pos["watermark"] = close
+                            trail = pos["watermark"] * (1.0 - self.cfg.trailing_stop_pct)
+                            if trail > pos["sl"]:
+                                pos["sl"] = trail
+                    else:
+                        wm = pos.get("watermark", pos["entry_price"])
+                        if close < wm:
+                            pos["watermark"] = close
+                            trail = pos["watermark"] * (1.0 + self.cfg.trailing_stop_pct)
+                            if trail < pos["sl"]:
+                                pos["sl"] = trail
 
             # ── Generate signal ────────────────────────────────────────────
             lookback_df = self.df.iloc[lookback_start:bar_idx + 1]
             if len(lookback_df) < 50:
                 equity_history.append((bar_time, capital))
                 continue
-
 
             try:
                 if asyncio.iscoroutinefunction(self.signal_fn):
@@ -272,9 +296,17 @@ class BacktestEngine:
             confidence = float(signal.get("confidence", 0.0))
             signal_log.append({"bar": bar_idx, "time": bar_time, "direction": direction, "confidence": confidence})
 
+            # ── Cooldown gate — skip re-entry too soon after a stop-loss ──
+            in_cooldown = (
+                direction != "none"
+                and self.cfg.cooldown_bars_after_sl > 0
+                and (bar_idx - last_sl_bar.get(direction, -9999)) < self.cfg.cooldown_bars_after_sl
+            )
+
             # ── Open position if signal strong enough and capacity allows ──
             if (
-                direction != "none"
+                not in_cooldown
+                and direction != "none"
                 and confidence >= 0.60
                 and len(open_positions) < self.cfg.max_open_positions
                 and not _already_in_symbol(open_positions, self.symbol)
@@ -460,7 +492,9 @@ def multi_factor_signal_fn() -> SignalFn:
             if adx_v > adx_prev:                      factors += 1
             if di_spread > 15:                        factors += 1
 
-        if factors < 2:
+        # Require at least 3 of 6 soft factors — 2 was too easy in trending markets.
+        # Re-entry frequency is controlled by cooldown_bars_after_sl in the engine.
+        if factors < 3:
             return {"direction": "none", "confidence": 0.0}
 
         # Base confidence from ADX strength; factors each add 0.05
