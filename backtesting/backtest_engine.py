@@ -56,7 +56,11 @@ class BacktestConfig:
     atr_tp_mult: float = 4.0             # target = entry ± atr_tp_mult × ATR (1:2 R:R)
     # Trailing stop — activates once price moves in our favour
     trailing_stop: bool = False
-    trailing_stop_pct: float = 0.03      # trail SL this far below the high-watermark (3%)
+    trailing_stop_pct: float = 0.08      # trail this far below the high-watermark
+                                         # must be LARGER than initial SL% to not fire immediately
+    trailing_atr_mult: float = 0.0       # >0: trail by N×ATR instead of fixed %; overrides pct
+    trail_activation_mult: float = 1.0  # only start trailing after price moves N×initial_SL_dist
+                                         # 0.0 = trail from bar 1; 1.0 = trail after 1R profit
     # Cooldown — bars to skip re-entry in same direction after a stop-loss
     cooldown_bars_after_sl: int = 0      # 0 = disabled
 
@@ -249,6 +253,14 @@ class BacktestEngine:
             high  = float(bar["high"])
             low   = float(bar["low"])
 
+            # ATR for trailing stop (computed cheaply on a rolling window)
+            bar_atr = 0.0
+            if self.cfg.trailing_stop and self.cfg.trailing_atr_mult > 0:
+                atr_start = max(lookback_start, bar_idx - self.cfg.atr_period * 4)
+                atr_slice = self.df.iloc[atr_start:bar_idx + 1]
+                if len(atr_slice) >= self.cfg.atr_period:
+                    bar_atr = _compute_atr(atr_slice, self.cfg.atr_period)
+
             # ── Check SL/TP, update trailing stops ────────────────────────
             for pos_id in list(open_positions.keys()):
                 pos = open_positions[pos_id]
@@ -261,19 +273,37 @@ class BacktestEngine:
                         last_sl_bar[pos["direction"]] = bar_idx
                     del open_positions[pos_id]
                 elif self.cfg.trailing_stop:
-                    # Ratchet the stop toward price as it moves in our favour
+                    # Ratchet the stop toward price as it moves in our favour.
+                    # Only activates after price has moved trail_activation_mult×initial_SL_dist
+                    # so the trail never interferes with the initial stop on small wiggles.
+                    sl_dist = pos["initial_sl_dist"]
+                    threshold = sl_dist * self.cfg.trail_activation_mult
+                    ep = pos["entry_price"]
+
                     if pos["direction"] == "long":
-                        wm = pos.get("watermark", pos["entry_price"])
-                        if close > wm:
-                            pos["watermark"] = close
-                            trail = pos["watermark"] * (1.0 - self.cfg.trailing_stop_pct)
+                        profit_dist = close - ep
+                        if profit_dist >= threshold:
+                            wm = pos.get("watermark", ep)
+                            if close > wm:
+                                pos["watermark"] = close
+                            wm = pos.get("watermark", ep)
+                            if self.cfg.trailing_atr_mult > 0 and bar_atr > 0:
+                                trail = wm - bar_atr * self.cfg.trailing_atr_mult
+                            else:
+                                trail = wm * (1.0 - self.cfg.trailing_stop_pct)
                             if trail > pos["sl"]:
                                 pos["sl"] = trail
                     else:
-                        wm = pos.get("watermark", pos["entry_price"])
-                        if close < wm:
-                            pos["watermark"] = close
-                            trail = pos["watermark"] * (1.0 + self.cfg.trailing_stop_pct)
+                        profit_dist = ep - close
+                        if profit_dist >= threshold:
+                            wm = pos.get("watermark", ep)
+                            if close < wm:
+                                pos["watermark"] = close
+                            wm = pos.get("watermark", ep)
+                            if self.cfg.trailing_atr_mult > 0 and bar_atr > 0:
+                                trail = wm + bar_atr * self.cfg.trailing_atr_mult
+                            else:
+                                trail = wm * (1.0 + self.cfg.trailing_stop_pct)
                             if trail < pos["sl"]:
                                 pos["sl"] = trail
 
@@ -338,6 +368,7 @@ class BacktestEngine:
                     "entry_price": entry_price,
                     "sl": sl,
                     "tp": tp,
+                    "initial_sl_dist": abs(entry_price - sl),  # for trail activation
                     "size_pct": self.cfg.position_size_pct,
                     "entry_value": capital * self.cfg.position_size_pct,
                     "entry_fee": fee_cost,
@@ -590,6 +621,74 @@ def quant_signal_fn(min_confidence: float = 0.55) -> SignalFn:
         if short_signal:
             return {"direction": "short", "confidence": conf}
         return {"direction": "none", "confidence": 0.0}
+
+    return _fn
+
+
+def breakout_signal_fn(
+    entry_bars: int = 20,
+    ema_period: int = 200,
+) -> SignalFn:
+    """
+    Donchian-channel breakout signal — event-based, not state-based.
+
+    Entry rules:
+      LONG:  current bar closes above the highest high of the prior `entry_bars`
+             bars AND price is above EMA-`ema_period` (macro uptrend filter).
+             Signal fires only on the FIRST bar of the breakout; subsequent bars
+             in the same breakout are suppressed (prev bar did not break out).
+      SHORT: mirror image, only when price < EMA-`ema_period`.
+
+    Why this works better than ADX/MACD signals:
+      - Fires on a concrete price event, not a lagging indicator state
+      - Naturally produces fewer, higher-conviction trades
+      - Channel width gives a built-in measure of recent volatility
+
+    Confidence is scaled by how much the close exceeds the channel edge,
+    relative to the channel width.
+    """
+    def _fn(df: pd.DataFrame) -> Dict[str, Any]:
+        need = entry_bars + ema_period + 5
+        if len(df) < need:
+            return {"direction": "none", "confidence": 0.0}
+
+        close = df["close"]
+        high  = df["high"]
+        low   = df["low"]
+
+        ema    = close.ewm(span=ema_period, adjust=False).mean()
+        cur_c  = float(close.iloc[-1])
+        cur_e  = float(ema.iloc[-1])
+
+        # Channel over the `entry_bars` bars BEFORE the current bar
+        ch_high = float(high.iloc[-(entry_bars + 1):-1].max())
+        ch_low  = float(low.iloc[-(entry_bars + 1):-1].min())
+
+        # Previous bar's channel (one bar older) — used to detect FIRST breakout bar
+        prev_c       = float(close.iloc[-2])
+        prev_ch_high = float(high.iloc[-(entry_bars + 2):-2].max())
+        prev_ch_low  = float(low.iloc[-(entry_bars + 2):-2].min())
+
+        going_long  = cur_c > ch_high and prev_c <= prev_ch_high and cur_c > cur_e
+        going_short = cur_c < ch_low  and prev_c >= prev_ch_low  and cur_c < cur_e
+
+        if not going_long and not going_short:
+            return {"direction": "none", "confidence": 0.0}
+
+        # Confidence from breakout strength relative to channel width
+        ch_width = ch_high - ch_low
+        if ch_width <= 0:
+            return {"direction": "none", "confidence": 0.0}
+        if going_long:
+            magnitude = (cur_c - ch_high) / ch_width
+        else:
+            magnitude = (ch_low - cur_c) / ch_width
+
+        confidence = min(0.65 + magnitude * 2.0, 0.92)
+        return {
+            "direction": "long" if going_long else "short",
+            "confidence": confidence,
+        }
 
     return _fn
 
