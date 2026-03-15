@@ -181,6 +181,7 @@ class BacktestEngine:
             )
 
             all_trades.extend(result.trades)
+            window_start_capital = capital
             if not result.equity_curve.empty:
                 all_equity.extend(zip(result.equity_curve.index, result.equity_curve.values))
                 capital = float(result.equity_curve.iloc[-1])
@@ -191,7 +192,7 @@ class BacktestEngine:
                 "test_start": self.df['timestamp'].iloc[test_slice[0]],
                 "test_end": self.df['timestamp'].iloc[test_slice[1] - 1],
                 "trades": len(result.trades),
-                "return_pct": result.equity_curve.iloc[-1] / capital - 1 if not result.equity_curve.empty else 0,
+                "return_pct": (capital / window_start_capital - 1) if not result.equity_curve.empty else 0,
             })
 
             start += test_w
@@ -276,7 +277,7 @@ class BacktestEngine:
                     close, direction,
                     order_value=capital * self.cfg.position_size_pct,
                 )
-                fee_cost = entry_price * capital * self.cfg.position_size_pct * self._fees.taker_pct
+                fee_cost = capital * self.cfg.position_size_pct * self._fees.taker_pct
                 sl = entry_price * (1 - self.cfg.stop_loss_pct) if direction == "long" else entry_price * (1 + self.cfg.stop_loss_pct)
                 tp = entry_price * (1 + self.cfg.take_profit_pct) if direction == "long" else entry_price * (1 - self.cfg.take_profit_pct)
 
@@ -431,4 +432,5 @@ def _compute_drawdown_series(equity: pd.Series) -> pd.Series:
     if equity.empty:
         return pd.Series(dtype=float)
     peak = equity.cummax()
-    return (equity - peak) / peak
+    dd = (equity - peak) / peak.replace(0, np.nan)
+    return dd.clip(lower=-1.0).fillna(0.0)
