@@ -39,8 +39,8 @@ class BacktestConfig:
     """Backtest configuration."""
     initial_capital: float = 10_000.0
     position_size_pct: float = 0.15       # 15% — large enough for meaningful equity moves
-    stop_loss_pct: float = 0.05           # 5% — wider for 4h crypto bars (ATR ~1-2%)
-    take_profit_pct: float = 0.10         # 10% — keeps 1:2 R:R vs 5% SL
+    stop_loss_pct: float = 0.05           # 5% — used when use_atr_stops=False
+    take_profit_pct: float = 0.10         # 10% — used when use_atr_stops=False
     max_open_positions: int = 3
     fee_model: FeeModel = field(default_factory=FeeModel)
     slippage_model: SlippageModel = field(default_factory=SlippageModel)
@@ -49,6 +49,11 @@ class BacktestConfig:
     train_window_bars: int = 200          # ~33 days on 4h — enough to warm indicators
     test_window_bars: int = 150           # ~25 days on 4h
     walk_forward: bool = True
+    # ATR-based adaptive stops
+    use_atr_stops: bool = False
+    atr_period: int = 14
+    atr_sl_mult: float = 2.0             # stop = entry ± atr_sl_mult × ATR
+    atr_tp_mult: float = 4.0             # target = entry ± atr_tp_mult × ATR (1:2 R:R)
 
 
 # ── Trade record ──────────────────────────────────────────────────────────────
@@ -279,8 +284,18 @@ class BacktestEngine:
                     order_value=capital * self.cfg.position_size_pct,
                 )
                 fee_cost = capital * self.cfg.position_size_pct * self._fees.taker_pct
-                sl = entry_price * (1 - self.cfg.stop_loss_pct) if direction == "long" else entry_price * (1 + self.cfg.stop_loss_pct)
-                tp = entry_price * (1 + self.cfg.take_profit_pct) if direction == "long" else entry_price * (1 - self.cfg.take_profit_pct)
+
+                if self.cfg.use_atr_stops:
+                    atr_val = _compute_atr(lookback_df, self.cfg.atr_period)
+                    if direction == "long":
+                        sl = entry_price - atr_val * self.cfg.atr_sl_mult
+                        tp = entry_price + atr_val * self.cfg.atr_tp_mult
+                    else:
+                        sl = entry_price + atr_val * self.cfg.atr_sl_mult
+                        tp = entry_price - atr_val * self.cfg.atr_tp_mult
+                else:
+                    sl = entry_price * (1 - self.cfg.stop_loss_pct) if direction == "long" else entry_price * (1 + self.cfg.stop_loss_pct)
+                    tp = entry_price * (1 + self.cfg.take_profit_pct) if direction == "long" else entry_price * (1 - self.cfg.take_profit_pct)
 
                 open_positions[next_pos_id] = {
                     "id": next_pos_id,
@@ -332,6 +347,129 @@ class BacktestEngine:
 
 
 # ── Built-in signal functions ─────────────────────────────────────────────────
+
+def multi_factor_signal_fn() -> SignalFn:
+    """
+    Multi-factor confluence signal — substantially higher bar than quant_signal_fn.
+
+    Hard requirements (all must pass):
+      1. ADX(14) >= 25            — confirmed trend strength, not just noise
+      2. Price on correct side of EMA200 — macro trend alignment
+      3. +DI/-DI aligned          — directional agreement
+      4. DI spread >= 5 pts       — clear divergence, not just a crossover tick
+
+    Soft confirmation (need >= 2 of 6):
+      • EMA50 aligned with EMA200     — medium-term trend agrees with macro
+      • MACD histogram positive AND increasing — momentum building, not fading
+      • Volume > 1.2× 20-bar avg     — conviction behind the move
+      • RSI in ideal entry zone       — 45–68 long, 32–55 short (not exhausted)
+      • ADX rising                    — trend still strengthening
+      • DI spread >= 15 pts           — strong directional conviction
+
+    Confidence = base (from ADX strength) + 0.05 per soft factor, capped at 0.92.
+    Signals below 0.60 are suppressed (engine threshold).
+    """
+    def _fn(df: pd.DataFrame) -> Dict[str, Any]:
+        if len(df) < 210:
+            return {"direction": "none", "confidence": 0.0}
+        if not all(c in df.columns for c in ("high", "low", "close", "volume")):
+            return {"direction": "none", "confidence": 0.0}
+
+        close  = df["close"]
+        high   = df["high"]
+        low    = df["low"]
+        volume = df["volume"]
+
+        # ── EMA stack ────────────────────────────────────────────────────
+        ema50  = close.ewm(span=50,  adjust=False).mean()
+        ema200 = close.ewm(span=200, adjust=False).mean()
+        close_v  = float(close.iloc[-1])
+        ema50_v  = float(ema50.iloc[-1])
+        ema200_v = float(ema200.iloc[-1])
+
+        # ── ADX / DI (Wilder, period=14) ─────────────────────────────────
+        period = 14
+        a = 1.0 / period
+        prev_c = close.shift(1)
+        tr = pd.concat([
+            high - low,
+            (high - prev_c).abs(),
+            (low  - prev_c).abs(),
+        ], axis=1).max(axis=1)
+        up   = high.diff()
+        down = -low.diff()
+        plus_dm  = pd.Series(np.where((up > down) & (up > 0),   up,   0.0), index=close.index)
+        minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=close.index)
+        atr14    = tr.ewm(alpha=a, adjust=False).mean()
+        plus_di  = 100 * plus_dm.ewm(alpha=a,  adjust=False).mean() / atr14.replace(0, np.nan)
+        minus_di = 100 * minus_dm.ewm(alpha=a, adjust=False).mean() / atr14.replace(0, np.nan)
+        dx       = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+        adx      = dx.ewm(alpha=a, adjust=False).mean()
+
+        def _s(s: pd.Series, d=0.0) -> float:
+            v = s.iloc[-1]; return float(v) if not pd.isna(v) else d
+        def _s2(s: pd.Series, d=0.0) -> float:
+            v = s.iloc[-2] if len(s) > 1 else s.iloc[-1]; return float(v) if not pd.isna(v) else d
+
+        adx_v = _s(adx);      adx_prev = _s2(adx)
+        pdi_v = _s(plus_di);  mdi_v    = _s(minus_di)
+
+        # ── MACD histogram ────────────────────────────────────────────────
+        macd_line   = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
+        macd_hist   = macd_line - macd_line.ewm(span=9, adjust=False).mean()
+        hist_v      = _s(macd_hist)
+        hist_prev   = _s2(macd_hist)
+
+        # ── RSI(14) ───────────────────────────────────────────────────────
+        delta = close.diff()
+        gain  = delta.clip(lower=0).rolling(period, min_periods=1).mean()
+        loss  = (-delta.clip(upper=0)).rolling(period, min_periods=1).mean()
+        rsi_v = _s(100 - 100 / (1 + gain / loss.replace(0, np.nan)), 50.0)
+
+        # ── Volume ratio ─────────────────────────────────────────────────
+        vol_ratio = float(volume.iloc[-1]) / max(float(volume.rolling(20, min_periods=1).mean().iloc[-1]), 1e-9)
+
+        # ── Hard requirements ─────────────────────────────────────────────
+        if adx_v < 25:
+            return {"direction": "none", "confidence": 0.0}
+
+        di_spread = abs(pdi_v - mdi_v)
+        if di_spread < 5:
+            return {"direction": "none", "confidence": 0.0}
+
+        going_long  = close_v > ema200_v and pdi_v > mdi_v and rsi_v < 75
+        going_short = close_v < ema200_v and mdi_v > pdi_v and rsi_v > 25
+
+        if not going_long and not going_short:
+            return {"direction": "none", "confidence": 0.0}
+
+        # ── Soft confirmation factors ─────────────────────────────────────
+        factors = 0
+        if going_long:
+            if ema50_v > ema200_v:                    factors += 1  # EMA stack aligned
+            if hist_v > 0 and hist_v > hist_prev:     factors += 1  # MACD building
+            if vol_ratio > 1.2:                       factors += 1  # volume expansion
+            if 45 <= rsi_v <= 68:                     factors += 1  # ideal RSI zone
+            if adx_v > adx_prev:                      factors += 1  # ADX rising
+            if di_spread > 15:                        factors += 1  # strong DI divergence
+        else:
+            if ema50_v < ema200_v:                    factors += 1
+            if hist_v < 0 and hist_v < hist_prev:     factors += 1
+            if vol_ratio > 1.2:                       factors += 1
+            if 32 <= rsi_v <= 55:                     factors += 1
+            if adx_v > adx_prev:                      factors += 1
+            if di_spread > 15:                        factors += 1
+
+        if factors < 2:
+            return {"direction": "none", "confidence": 0.0}
+
+        # Base confidence from ADX strength; factors each add 0.05
+        confidence = min(0.55 + adx_v / 200.0 + factors * 0.05, 0.92)
+        direction  = "long" if going_long else "short"
+        return {"direction": direction, "confidence": confidence}
+
+    return _fn
+
 
 def quant_signal_fn(min_confidence: float = 0.55) -> SignalFn:
     """
@@ -423,6 +561,20 @@ def quant_signal_fn(min_confidence: float = 0.55) -> SignalFn:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _compute_atr(df: pd.DataFrame, period: int = 14) -> float:
+    """Wilder ATR from a lookback DataFrame. Falls back to 2% of close if too few bars."""
+    if len(df) < period:
+        return float(df["close"].iloc[-1]) * 0.02
+    close = df["close"]
+    high  = df["high"]
+    low   = df["low"]
+    prev  = close.shift(1)
+    tr = pd.concat([high - low, (high - prev).abs(), (low - prev).abs()], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1.0 / period, adjust=False).mean()
+    val = float(atr.iloc[-1])
+    return val if not np.isnan(val) else float(close.iloc[-1]) * 0.02
+
 
 def _check_sl_tp(
     pos: Dict, high: float, low: float, close: float
