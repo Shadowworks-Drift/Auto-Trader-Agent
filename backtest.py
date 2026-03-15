@@ -116,7 +116,7 @@ async def async_main(args: argparse.Namespace) -> None:
     from config.settings import Settings
     from backtesting.backtest_engine import (
         BacktestConfig, BacktestEngine,
-        multi_factor_signal_fn, quant_signal_fn,
+        breakout_signal_fn, multi_factor_signal_fn, quant_signal_fn,
     )
     from backtesting.report import BacktestReport
     from backtesting.slippage_model import FeeModel, SlippageModel
@@ -126,8 +126,15 @@ async def async_main(args: argparse.Namespace) -> None:
     settings = Settings.from_yaml(Path(args.config))
 
     # ── Signal selection ──────────────────────────────────────────────────────
-    signal_fn = multi_factor_signal_fn() if args.signal == "multi" else quant_signal_fn()
-    signal_label = "multi-factor" if args.signal == "multi" else "quant (ADX/DI)"
+    if args.signal == "breakout":
+        signal_fn    = breakout_signal_fn(entry_bars=args.breakout_bars)
+        signal_label = f"breakout (Donchian-{args.breakout_bars})"
+    elif args.signal == "multi":
+        signal_fn    = multi_factor_signal_fn()
+        signal_label = "multi-factor"
+    else:
+        signal_fn    = quant_signal_fn()
+        signal_label = "quant (ADX/DI)"
 
     # ── Walk-forward window sizing scaled to chosen timeframe ─────────────────
     train_bars = days_to_bars(args.train_days, args.timeframe)
@@ -152,6 +159,8 @@ async def async_main(args: argparse.Namespace) -> None:
         atr_tp_mult=args.atr_tp_mult,
         trailing_stop=args.trailing_stop,
         trailing_stop_pct=args.trailing_stop_pct,
+        trailing_atr_mult=args.trailing_atr_mult,
+        trail_activation_mult=args.trail_activation_r,
         cooldown_bars_after_sl=args.cooldown,
     )
 
@@ -215,7 +224,12 @@ async def async_main(args: argparse.Namespace) -> None:
         else:
             stops_label = f"fixed {sl_pct*100:.0f}% SL / {tp_pct*100:.0f}% TP"
         if args.trailing_stop:
-            stops_label += f" + trail {args.trailing_stop_pct*100:.0f}%"
+            if args.trailing_atr_mult > 0:
+                stops_label += f" + trail {args.trailing_atr_mult:.1f}×ATR"
+            else:
+                stops_label += f" + trail {args.trailing_stop_pct*100:.0f}%"
+            if args.trail_activation_r > 0:
+                stops_label += f" (act@{args.trail_activation_r:.1f}R)"
         cooldown_label = f"  |  cooldown {args.cooldown}b after SL" if args.cooldown > 0 else ""
         console.print(
             f"  Signal: [bold]{signal_label}[/bold]  |  "
@@ -266,9 +280,12 @@ def main() -> None:
                         help="Test window in calendar days (default: 30)")
 
     # Signal selection
-    parser.add_argument("--signal", default="multi", choices=["multi", "quant"],
+    parser.add_argument("--signal", default="multi", choices=["multi", "quant", "breakout"],
                         help="Signal function: 'multi' = multi-factor confluence (default), "
-                             "'quant' = ADX/DI crossover (original)")
+                             "'quant' = ADX/DI crossover, "
+                             "'breakout' = Donchian channel breakout (event-based)")
+    parser.add_argument("--breakout-bars", dest="breakout_bars", type=int, default=20,
+                        help="Donchian channel width for --signal breakout (default: 20 bars = 80h on 4h)")
 
     # Fixed SL/TP overrides (override config values without editing yaml)
     parser.add_argument("--sl", dest="sl_pct", type=float, default=None,
@@ -287,8 +304,16 @@ def main() -> None:
     # Trailing stop
     parser.add_argument("--trailing-stop", action="store_true", default=False,
                         help="Trail stop loss as trade moves in your favour (lets winners run)")
-    parser.add_argument("--trailing-stop-pct", dest="trailing_stop_pct", type=float, default=0.03,
-                        help="How far below high-watermark to trail the stop (default: 0.03 = 3%%)")
+    parser.add_argument("--trailing-stop-pct", dest="trailing_stop_pct", type=float, default=0.08,
+                        help="Fixed %% trail below high-watermark (default: 0.08 = 8%%). "
+                             "Must exceed initial SL%% to avoid firing on noise. "
+                             "Ignored when --trailing-atr-mult is set.")
+    parser.add_argument("--trailing-atr-mult", dest="trailing_atr_mult", type=float, default=0.0,
+                        help="ATR-based trail distance: trail = N×ATR below watermark. "
+                             ">0 overrides --trailing-stop-pct. Good values: 3.0–4.0.")
+    parser.add_argument("--trail-activation-r", dest="trail_activation_r", type=float, default=1.0,
+                        help="Only start trailing after being up N×initial_SL_dist (default 1.0 = 1R). "
+                             "Prevents the trail from firing before the trade has any cushion.")
 
     # Cooldown after stop-loss
     parser.add_argument("--cooldown", dest="cooldown", type=int, default=10,
