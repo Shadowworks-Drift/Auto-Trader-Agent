@@ -166,7 +166,8 @@ class BacktestReport:
         t1.add_row("Calmar Ratio", _colour(s["calmar"]))
         t1.add_row("Max Drawdown", f"[red]{s['max_drawdown_pct']:.2f}%[/red]")
         t1.add_row("Win Rate", f"{s['win_rate_pct']:.1f}%")
-        t1.add_row("Profit Factor", _colour(s["profit_factor"] - 1))
+        pf = s["profit_factor"]
+        t1.add_row("Profit Factor", f"[{'green' if pf >= 1 else 'red'}]{pf:.2f}[/]")
         t1.add_row("Expectancy", f"${s['expectancy_usd']:+.2f}")
         t1.add_row("Total Costs", f"[yellow]${s['total_costs_usd']:.2f} ({s['costs_pct']:.2f}%)[/yellow]")
         if s["wf_consistency_pct"] is not None:
