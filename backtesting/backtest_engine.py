@@ -335,20 +335,18 @@ class BacktestEngine:
 
 def quant_signal_fn(min_confidence: float = 0.55) -> SignalFn:
     """
-    Regime-aware trend-following strategy using a 4-factor EMA stack.
+    EMA crossover trigger with trend + momentum confirmation.
 
-    Factors (each ±1):
-      F1  EMA9  vs EMA21  — short-term trend direction
-      F2  EMA21 vs EMA50  — medium-term trend direction
-      F3  EMA50 10-bar slope > ±0.3% — trend has momentum
-      F4  MACD line vs signal line — momentum confirmation
+    Fires ONLY on EMA9/EMA21 crossover bars (event-based, not state-based).
+    This prevents the rapid re-entry churn that occurs when alignment-based
+    signals fire every bar in choppy markets.
 
-    RSI(14) acts as an exclusion filter: no longs when RSI > 75 (overbought),
-    no shorts when RSI < 25 (oversold).
+    Confirmation (need ≥ 2 of 3):
+      C1  EMA21 aligned with crossover direction vs EMA50 (trend filter)
+      C2  EMA50 10-bar slope positive/negative (trend has momentum)
+      C3  MACD line vs signal line (momentum agreement)
 
-    Entry: 3 or 4 factors aligned → confidence = count/4 (0.75 or 1.0).
-    This correctly switches from short→long as the EMA stack flips, capturing
-    both the April 2024 BTC correction (bearish stack) and May recovery (bullish).
+    RSI(14) is an exclusion-only filter (no overbought longs / oversold shorts).
     """
     def _fn(df: pd.DataFrame) -> Dict[str, Any]:
         if len(df) < 60:
@@ -362,40 +360,47 @@ def quant_signal_fn(min_confidence: float = 0.55) -> SignalFn:
         ema21 = close.ewm(span=21, adjust=False).mean()
         ema50 = close.ewm(span=50, adjust=False).mean()
 
-        e9  = float(ema9.iloc[-1])
-        e21 = float(ema21.iloc[-1])
-        e50 = float(ema50.iloc[-1])
+        e9      = float(ema9.iloc[-1]);  e9_prev  = float(ema9.iloc[-2])
+        e21     = float(ema21.iloc[-1]); e21_prev = float(ema21.iloc[-2])
+        e50     = float(ema50.iloc[-1])
 
-        # ── EMA50 10-bar slope ─────────────────────────────────────────────
-        lookback    = min(10, n - 1)
-        e50_past    = float(ema50.iloc[-1 - lookback])
-        slope       = (e50 - e50_past) / e50_past if e50_past != 0 else 0.0
+        # ── Only act on crossover bars ─────────────────────────────────────
+        cross_up = e9 > e21 and e9_prev <= e21_prev   # EMA9 just crossed above EMA21
+        cross_dn = e9 < e21 and e9_prev >= e21_prev   # EMA9 just crossed below EMA21
+        if not cross_up and not cross_dn:
+            return {"direction": "none", "confidence": 0.0}
 
-        # ── MACD(12,26,9) ─────────────────────────────────────────────────
+        # ── Confirmation factors ───────────────────────────────────────────
+        lookback = min(10, n - 1)
+        e50_past = float(ema50.iloc[-1 - lookback])
+        slope    = (e50 - e50_past) / e50_past if e50_past != 0 else 0.0
+
         macd_line   = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
         signal_line = macd_line.ewm(span=9, adjust=False).mean()
         macd_bull   = float(macd_line.iloc[-1]) > float(signal_line.iloc[-1])
 
-        # ── RSI(14) exclusion filter ───────────────────────────────────────
         delta = close.diff()
         gain  = delta.clip(lower=0).rolling(14, min_periods=1).mean()
         loss  = (-delta.clip(upper=0)).rolling(14, min_periods=1).mean()
         rsi   = 100 - 100 / (1 + gain / loss.replace(0, np.nan))
         rsi_v = float(rsi.iloc[-1]) if not pd.isna(rsi.iloc[-1]) else 50.0
 
-        # ── Factor scores ─────────────────────────────────────────────────
-        f1 = 1 if e9  > e21 else -1                         # EMA9  vs EMA21
-        f2 = 1 if e21 > e50 else -1                         # EMA21 vs EMA50
-        f3 = 1 if slope > 0.003 else (-1 if slope < -0.003 else 0)  # slope
-        f4 = 1 if macd_bull else -1                         # MACD
+        if cross_up:
+            c1 = e21 > e50             # medium trend bullish
+            c2 = slope > 0.001         # EMA50 rising
+            c3 = macd_bull             # MACD confirms
+            confirms = sum([c1, c2, c3])
+            if confirms >= 2 and rsi_v < 75:
+                return {"direction": "long",  "confidence": 0.75 + 0.08 * (confirms - 2)}
 
-        bull = sum(1 for f in [f1, f2, f3, f4] if f > 0)
-        bear = sum(1 for f in [f1, f2, f3, f4] if f < 0)
+        if cross_dn:
+            c1 = e21 < e50             # medium trend bearish
+            c2 = slope < -0.001        # EMA50 falling
+            c3 = not macd_bull         # MACD confirms
+            confirms = sum([c1, c2, c3])
+            if confirms >= 2 and rsi_v > 25:
+                return {"direction": "short", "confidence": 0.75 + 0.08 * (confirms - 2)}
 
-        if bull >= 3 and rsi_v < 75:
-            return {"direction": "long",  "confidence": bull / 4.0}
-        if bear >= 3 and rsi_v > 25:
-            return {"direction": "short", "confidence": bear / 4.0}
         return {"direction": "none", "confidence": 0.0}
 
     return _fn
