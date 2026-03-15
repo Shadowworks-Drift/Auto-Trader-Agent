@@ -79,8 +79,14 @@ class BacktestReport:
         profit_factor = abs(sum(t.pnl_after_costs for t in wins)) / max(abs(sum(t.pnl_after_costs for t in losses)), 1e-9)
         expectancy    = win_rate * avg_win + (1 - win_rate) * avg_loss
 
-        # Ratio metrics (daily returns from equity curve)
-        daily_returns = equity.pct_change().dropna()
+        # Ratio metrics — resample to true daily returns first so the
+        # Sharpe/Sortino formulas (rf=0.05/252, sqrt(252)) are correctly scaled
+        # regardless of the bar frequency (e.g. 4h gives 6 bars/day).
+        try:
+            eq_daily = equity.resample('D').last().dropna()
+            daily_returns = eq_daily.pct_change().dropna() if len(eq_daily) >= 2 else equity.pct_change().dropna()
+        except Exception:
+            daily_returns = equity.pct_change().dropna()
         sharpe  = _sharpe(daily_returns)
         sortino = _sortino(daily_returns)
 
