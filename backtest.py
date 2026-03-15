@@ -114,13 +114,20 @@ async def fetch_full_history(
 
 async def async_main(args: argparse.Namespace) -> None:
     from config.settings import Settings
-    from backtesting.backtest_engine import BacktestConfig, BacktestEngine, quant_signal_fn
+    from backtesting.backtest_engine import (
+        BacktestConfig, BacktestEngine,
+        multi_factor_signal_fn, quant_signal_fn,
+    )
     from backtesting.report import BacktestReport
     from backtesting.slippage_model import FeeModel, SlippageModel
     from rich.console import Console
 
     console = Console()
     settings = Settings.from_yaml(Path(args.config))
+
+    # ── Signal selection ──────────────────────────────────────────────────────
+    signal_fn = multi_factor_signal_fn() if args.signal == "multi" else quant_signal_fn()
+    signal_label = "multi-factor" if args.signal == "multi" else "quant (ADX/DI)"
 
     # ── Walk-forward window sizing scaled to chosen timeframe ─────────────────
     train_bars = days_to_bars(args.train_days, args.timeframe)
@@ -137,10 +144,13 @@ async def async_main(args: argparse.Namespace) -> None:
         walk_forward=args.walk_forward,
         train_window_bars=train_bars,
         test_window_bars=test_bars,
+        use_atr_stops=args.atr_stops,
+        atr_sl_mult=args.atr_sl_mult,
+        atr_tp_mult=args.atr_tp_mult,
     )
 
     if args.csv:
-        engine = BacktestEngine.from_csv(args.symbol, args.csv, quant_signal_fn(), cfg)
+        engine = BacktestEngine.from_csv(args.symbol, args.csv, signal_fn, cfg)
     else:
         import ccxt.async_support as ccxt
         import pandas as pd
@@ -194,13 +204,18 @@ async def async_main(args: argparse.Namespace) -> None:
             f"  Loaded [bold]{len(df):,}[/bold] bars  "
             f"[dim]{df['timestamp'].iloc[0]:%Y-%m-%d} → {df['timestamp'].iloc[-1]:%Y-%m-%d}[/dim]"
         )
+        stops_label = (
+            f"ATR×{args.atr_sl_mult:.1f}/×{args.atr_tp_mult:.1f}"
+            if args.atr_stops else
+            f"fixed {settings.risk.stop_loss_pct*100:.0f}%/{settings.risk.take_profit_pct*100:.0f}%"
+        )
         console.print(
-            f"  Walk-forward: [bold]{train_bars}[/bold] train bars / "
-            f"[bold]{test_bars}[/bold] test bars  "
-            f"[dim](~{args.train_days:.0f}d / ~{args.test_days:.0f}d)[/dim]"
+            f"  Signal: [bold]{signal_label}[/bold]  |  "
+            f"Stops: [bold]{stops_label}[/bold]  |  "
+            f"WF: [bold]{train_bars}[/bold] train / [bold]{test_bars}[/bold] test bars"
         )
 
-        engine = BacktestEngine(args.symbol, df, quant_signal_fn(), cfg)
+        engine = BacktestEngine(args.symbol, df, signal_fn, cfg)
 
     console.print(f"\nRunning backtest{'  (walk-forward)' if args.walk_forward else ''}...")
     results = await engine.run()
@@ -241,6 +256,20 @@ def main() -> None:
                         help="Training window in calendar days (default: 90)")
     parser.add_argument("--test-days",  dest="test_days",  type=float, default=30,
                         help="Test window in calendar days (default: 30)")
+
+    # Signal selection
+    parser.add_argument("--signal", default="multi", choices=["multi", "quant"],
+                        help="Signal function: 'multi' = multi-factor confluence (default), "
+                             "'quant' = ADX/DI crossover (original)")
+
+    # ATR-based adaptive stops
+    parser.add_argument("--atr-stops", action="store_true", default=False,
+                        help="Use ATR-based adaptive stop loss / take profit instead of fixed %%")
+    parser.add_argument("--atr-sl-mult", dest="atr_sl_mult", type=float, default=2.0,
+                        help="ATR multiplier for stop loss (default: 2.0 → SL = 2×ATR from entry)")
+    parser.add_argument("--atr-tp-mult", dest="atr_tp_mult", type=float, default=4.0,
+                        help="ATR multiplier for take profit (default: 4.0 → 1:2 R:R with 2.0 SL mult)")
+
     parser.add_argument("--save",      help="Save JSON results to this path")
     args = parser.parse_args()
     asyncio.run(async_main(args))
